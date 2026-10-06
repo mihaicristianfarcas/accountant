@@ -214,10 +214,18 @@ fn callout(buf: &mut Buffer, x: u16, y: u16, width: u16, lines: &[String], color
     }
 }
 
+/// A key on a card, drawn as a keycap.
 fn keycap(k: &str) -> Span<'static> {
     Span::styled(format!(" {k} "), bold(TEXT).bg(KEYCAP))
 }
 
+/// A key on the main screen: no background, which would sit as an opaque
+/// block on translucent or image terminal backgrounds.
+fn key(k: &str) -> Span<'static> {
+    Span::styled(k.to_string(), bold(TEXT))
+}
+
+/// Key hints inside a card.
 fn hints(pairs: &[(&str, &str)]) -> Line<'static> {
     let mut spans = vec![];
     for (i, (k, label)) in pairs.iter().enumerate() {
@@ -226,6 +234,19 @@ fn hints(pairs: &[(&str, &str)]) -> Line<'static> {
         }
         spans.push(keycap(k));
         spans.push(Span::styled(format!(" {label}"), fg(mix(DIM, FAINT, 0.35))));
+    }
+    Line::from(spans)
+}
+
+/// Key hints on the main screen.
+fn bare_hints(pairs: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![];
+    for (i, (k, label)) in pairs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(key(k));
+        spans.push(Span::styled(format!(" {label}"), fg(FAINT)));
     }
     Line::from(spans)
 }
@@ -467,7 +488,7 @@ fn draw_list(
             Item::Header(p, n) => header_line(*p, *n, width),
             Item::Empty(p) => Line::from(vec![
                 Span::styled("    no saved accounts yet — ", fg(FAINT)),
-                keycap("a"),
+                key("a"),
                 Span::styled(format!(" to sign in to {}", p.label()), fg(FAINT)),
             ]),
             Item::Row(i) | Item::Detail(i) => {
@@ -588,7 +609,7 @@ fn detail_line(
     let windows = app.usage.by_profile.get(&p.id).map(|u| u.windows.as_slice()).unwrap_or_default();
     if p.needs_login {
         spans.push(Span::styled("saved session expired — ", fg(mix(WARN, DIM, 0.35))));
-        spans.push(keycap("r"));
+        spans.push(key("r"));
         spans.push(Span::styled(" to sign in again", fg(mix(WARN, DIM, 0.35))));
     } else if !windows.is_empty() {
         let shown = shown_windows(windows, cols.windows.max(1), now);
@@ -672,7 +693,7 @@ fn window_spans(
 /// One-line status for compact rows: the binding window, or what we know.
 fn compact_status(app: &App, p: &Profile, now: DateTime<Utc>) -> Vec<Span<'static>> {
     if p.needs_login {
-        return vec![Span::styled("⚠ sign in again ", fg(WARN)), keycap("r")];
+        return vec![Span::styled("⚠ sign in again ", fg(WARN)), key("r")];
     }
     if let Some(u) = app.usage.by_profile.get(&p.id) {
         let reset_since = u.windows.iter().any(|w| w.used >= 50.0 && w.resets_at.is_some_and(|r| r <= now));
@@ -776,12 +797,12 @@ fn draw_footer(buf: &mut Buffer, r: Rect, dim: bool) {
         ("q", "quit"),
     ];
     for drop in ["d", "n", ",", "t", "r", "a"] {
-        if (hints(&keys).width() as u16) <= r.width {
+        if (bare_hints(&keys).width() as u16) <= r.width {
             break;
         }
         keys.retain(|(k, _)| *k != drop);
     }
-    let line = hints(&keys);
+    let line = bare_hints(&keys);
     let line = if dim { faded(line, 0.7) } else { line };
     centered_line(buf, r, r.y, &line);
 }

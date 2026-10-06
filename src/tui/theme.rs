@@ -3,12 +3,15 @@
 use crate::providers::Provider;
 use ratatui::style::{Color, Modifier, Style};
 
-pub const TEXT: Color = Color::Rgb(226, 227, 234);
-pub const DIM: Color = Color::Rgb(128, 131, 148);
-pub const FAINT: Color = Color::Rgb(72, 75, 90);
-pub const GHOST: Color = Color::Rgb(44, 46, 56);
+// Text tiers stay readable on translucent and image backgrounds: even FAINT
+// keeps about 4.5:1 contrast against near-black.
+pub const TEXT: Color = Color::Rgb(232, 233, 240);
+pub const DIM: Color = Color::Rgb(172, 176, 194);
+pub const FAINT: Color = Color::Rgb(134, 138, 158);
+/// Rules, empty meter cells, and what dimmed content fades towards.
+pub const GHOST: Color = Color::Rgb(84, 87, 104);
 pub const ROW_HL: Color = Color::Rgb(30, 32, 42);
-/// Raised surfaces: modal cards, and the keycaps in key hints.
+/// Raised surfaces: modal cards, and the keycaps in their key hints.
 pub const CARD: Color = Color::Rgb(22, 23, 31);
 pub const KEYCAP: Color = Color::Rgb(46, 48, 62);
 /// What backgrounds fade towards when dimmed (a typical dark terminal).
