@@ -59,11 +59,16 @@ pub struct Cache {
 
 impl Cache {
     pub fn load(path: &Path) -> Self {
-        fsutil::read_optional(path)
+        let mut cache: Cache = fsutil::read_optional(path)
             .ok()
             .flatten()
             .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Answers cached before unknown fields were ignored.
+        for u in cache.by_profile.values_mut() {
+            u.windows.retain(|w| is_window_label(&w.label));
+        }
+        cache
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -131,11 +136,20 @@ fn parse_time(v: &Value) -> Option<DateTime<Utc>> {
     }
 }
 
-/// `{"five_hour": {"utilization": 42.0, "resets_at": "…"}, "seven_day": {…}}`
+/// "5h", "7d", "7d opus": a window length, then an optional qualifier.
+fn is_window_label(label: &str) -> bool {
+    let len = label.split(' ').next().unwrap_or("");
+    len.len() >= 2 && len.ends_with(['h', 'd']) && len[..len.len() - 1].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `{"five_hour": {"utilization": 42.0, "resets_at": "…"}, "seven_day": {…}}`.
+/// Only the rate-limit windows: the response also carries other objects that
+/// have a `utilization` but are not limits you can run into.
 fn parse_claude(v: &Value) -> Vec<Window> {
     let Some(obj) = v.as_object() else { return vec![] };
     let mut out: Vec<Window> = obj
         .iter()
+        .filter(|(k, _)| matches!(k.as_str(), "five_hour" | "seven_day") || k.starts_with("seven_day_"))
         .filter_map(|(k, w)| {
             let used = w.get("utilization")?.as_f64()?;
             let label = match k.as_str() {
@@ -185,6 +199,7 @@ mod tests {
             "seven_day": {"utilization": 30.0, "resets_at": "2026-10-10T00:00:00Z"},
             "five_hour": {"utilization": 100.0, "resets_at": "2026-10-06T15:00:00+00:00"},
             "seven_day_opus": {"utilization": 5.0, "resets_at": null},
+            "iguana_necktie": {"utilization": 0.0, "resets_at": null},
             "extra": null
         });
         let w = parse_claude(&v);
@@ -203,6 +218,23 @@ mod tests {
         assert_eq!(w[0].label, "5h");
         assert_eq!(w[1].label, "7d");
         assert_eq!(w[1].resets_at.unwrap().timestamp(), 1791288000);
+    }
+
+    #[test]
+    fn cached_windows_with_unknown_labels_are_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.json");
+        let window = |label: &str| Window { label: label.into(), used: 1.0, resets_at: None };
+        let labels = ["5h", "7d", "7d opus", "1d", "iguana necktie", "h", "7x"];
+        let mut cache = Cache::default();
+        cache.by_profile.insert(
+            "p".into(),
+            Usage { windows: labels.iter().map(|l| window(l)).collect(), fetched_at: Utc::now() },
+        );
+        cache.save(&path).unwrap();
+        let kept: Vec<String> =
+            Cache::load(&path).by_profile["p"].windows.iter().map(|w| w.label.clone()).collect();
+        assert_eq!(kept, ["5h", "7d", "7d opus", "1d"]);
     }
 
     #[test]
