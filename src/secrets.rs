@@ -5,16 +5,26 @@
 //! that Claude Code created are readable without an extra "allow access" prompt,
 //! and secrets are piped through stdin as hex — they never appear in argv.
 //!
+//! `security -i` reads each command into a 4 KiB line buffer and runs whatever
+//! spills over as more commands, so every line has to stay short. accountant's
+//! own values that would not fit (a Codex login carries several JWTs) are
+//! stored in pieces; see [`write_value`].
+//!
 //! Elsewhere (or with `ACCOUNTANT_SECRETS=file`) secrets are 0600 files in a
 //! 0700 directory.
 
 use crate::fsutil;
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 pub const SERVICE: &str = "accountant";
+
+/// Longest command line `security -i` takes whole.
+const LINE_MAX: usize = 4000;
 
 /// A generic-password slot in the macOS Keychain.
 #[derive(Debug, Clone)]
@@ -29,6 +39,11 @@ impl KeychainItem {
     }
 
     pub fn get(&self) -> Result<Option<String>> {
+        Ok(self.get_raw()?.map(decode_if_hex))
+    }
+
+    /// The value exactly as `security -w` prints it.
+    fn get_raw(&self) -> Result<Option<String>> {
         let out = Command::new("security")
             .args(["find-generic-password", "-s", &self.service, "-a", &self.account, "-w"])
             .stdin(Stdio::null())
@@ -48,32 +63,30 @@ impl KeychainItem {
         while s.ends_with('\n') || s.ends_with('\r') {
             s.pop();
         }
-        Ok(Some(decode_if_hex(s)))
+        Ok(Some(s))
     }
 
     pub fn set(&self, value: &str) -> Result<()> {
-        // `security -i` reads commands from stdin, so the secret never shows up
-        // in the process list. Hex avoids every quoting problem.
+        security_batch(&self.service, &[self.add_command(value)?])
+    }
+
+    /// `security -i` reads commands from stdin, so the secret never shows up
+    /// in the process list. Hex avoids every quoting problem.
+    fn add_command(&self, value: &str) -> Result<String> {
         let line = format!(
             "add-generic-password -U -s {} -a {} -X {}\n",
             quote(&self.service),
             quote(&self.account),
             hex::encode(value.as_bytes())
         );
-        let mut child = Command::new("security")
-            .arg("-i")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("running `security` (macOS Keychain)")?;
-        child.stdin.take().unwrap().write_all(line.as_bytes())?;
-        let out = child.wait_with_output()?;
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if !out.status.success() || stderr.contains("error") {
-            bail!("keychain write failed for '{}': {}", self.service, stderr.trim());
+        if line.len() > LINE_MAX {
+            bail!(
+                "keychain write failed for '{}': the value is too long for `security` ({} bytes)",
+                self.service,
+                value.len()
+            );
         }
-        Ok(())
+        Ok(line)
     }
 
     pub fn delete(&self) -> Result<()> {
@@ -88,6 +101,28 @@ impl KeychainItem {
             _ => bail!("keychain delete failed for '{}'", self.service),
         }
     }
+}
+
+/// Run `add-generic-password` commands through one `security -i`.
+fn security_batch(service: &str, lines: &[String]) -> Result<()> {
+    let mut child = Command::new("security")
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running `security` (macOS Keychain)")?;
+    let mut stdin = child.stdin.take().unwrap();
+    for line in lines {
+        stdin.write_all(line.as_bytes())?;
+    }
+    drop(stdin);
+    let out = child.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() || stderr.contains("error") || stderr.contains("unknown command") {
+        bail!("keychain write failed for '{service}': {}", stderr.trim());
+    }
+    Ok(())
 }
 
 fn quote(s: &str) -> String {
@@ -110,6 +145,107 @@ fn decode_if_hex(s: String) -> String {
         }
     }
     s
+}
+
+/// Where the vault keeps its items: the login Keychain, or a map in tests.
+trait Slots {
+    fn read(&self, account: &str) -> Result<Option<String>>;
+    /// Writes every item, or fails.
+    fn write(&self, items: &[(String, String)]) -> Result<()>;
+    fn remove(&self, account: &str) -> Result<()>;
+}
+
+struct Keychain;
+
+impl Slots for Keychain {
+    fn read(&self, account: &str) -> Result<Option<String>> {
+        KeychainItem::new(SERVICE, account).get_raw()
+    }
+
+    fn write(&self, items: &[(String, String)]) -> Result<()> {
+        let lines = items
+            .iter()
+            .map(|(account, value)| KeychainItem::new(SERVICE, account).add_command(value))
+            .collect::<Result<Vec<_>>>()?;
+        security_batch(SERVICE, &lines)
+    }
+
+    fn remove(&self, account: &str) -> Result<()> {
+        KeychainItem::new(SERVICE, account).delete()
+    }
+}
+
+/// A value too long for one `security -i` line is stored as base64 pieces
+/// `<key>#<gen>.<i>`; the item itself then holds `PIECES<gen>:<count>`.
+const PIECES: &str = "accountant-pieces:v1:";
+/// Bytes per piece: base64, then hex, makes a line ~2.7× this.
+const PIECE_BYTES: usize = 1200;
+
+fn piece_key(key: &str, generation: &str, i: usize) -> String {
+    format!("{key}#{generation}.{i}")
+}
+
+fn pieces_header(raw: &str) -> Option<(String, usize)> {
+    let (generation, count) = raw.strip_prefix(PIECES)?.split_once(':')?;
+    Some((generation.to_string(), count.parse().ok()?))
+}
+
+fn read_value(slots: &impl Slots, key: &str) -> Result<Option<String>> {
+    let Some(raw) = slots.read(key)? else { return Ok(None) };
+    let Some((generation, count)) = pieces_header(&raw) else { return Ok(Some(decode_if_hex(raw))) };
+    let mut bytes = vec![];
+    for i in 0..count {
+        let piece = slots
+            .read(&piece_key(key, &generation, i))?
+            .with_context(|| format!("keychain item '{key}' is missing piece {} of {count}", i + 1))?;
+        bytes.extend(
+            BASE64.decode(piece.trim()).with_context(|| format!("keychain item '{key}' is damaged"))?,
+        );
+    }
+    Ok(Some(String::from_utf8(bytes).context("keychain item is not UTF-8")?))
+}
+
+/// New pieces are written before the header that names them, and the old ones
+/// removed only after, so an interrupted write leaves the previous value.
+fn write_value(slots: &impl Slots, key: &str, value: &str) -> Result<()> {
+    let old = slots.read(key)?.as_deref().and_then(pieces_header);
+    let mut generation = None;
+    if KeychainItem::new(SERVICE, key).add_command(value).is_ok() {
+        slots.write(&[(key.to_string(), value.to_string())])?;
+    } else {
+        let mut rnd = [0u8; 4];
+        getrandom::fill(&mut rnd).context("system RNG")?;
+        let g = hex::encode(rnd);
+        let pieces: Vec<(String, String)> = value
+            .as_bytes()
+            .chunks(PIECE_BYTES)
+            .enumerate()
+            .map(|(i, chunk)| (piece_key(key, &g, i), BASE64.encode(chunk)))
+            .collect();
+        slots.write(&pieces)?;
+        slots.write(&[(key.to_string(), format!("{PIECES}{g}:{}", pieces.len()))])?;
+        generation = Some(g);
+    }
+    if let Some((old_gen, count)) = old
+        && generation.as_ref() != Some(&old_gen)
+    {
+        for i in 0..count {
+            // Leftovers are harmless; the new value is already in place.
+            let _ = slots.remove(&piece_key(key, &old_gen, i));
+        }
+    }
+    Ok(())
+}
+
+fn delete_value(slots: &impl Slots, key: &str) -> Result<()> {
+    let old = slots.read(key)?.as_deref().and_then(pieces_header);
+    slots.remove(key)?;
+    if let Some((generation, count)) = old {
+        for i in 0..count {
+            slots.remove(&piece_key(key, &generation, i))?;
+        }
+    }
+    Ok(())
 }
 
 /// accountant's own secret vault.
@@ -138,14 +274,14 @@ impl Vault {
 
     pub fn get(&self, key: &str) -> Result<Option<String>> {
         match self {
-            Vault::Keychain => KeychainItem::new(SERVICE, key).get(),
+            Vault::Keychain => read_value(&Keychain, key),
             Vault::Files(dir) => fsutil::read_optional(&dir.join(file_name(key))),
         }
     }
 
     pub fn set(&self, key: &str, value: &str) -> Result<()> {
         match self {
-            Vault::Keychain => KeychainItem::new(SERVICE, key).set(value),
+            Vault::Keychain => write_value(&Keychain, key, value),
             Vault::Files(dir) => {
                 fsutil::private_dir(dir)?;
                 fsutil::write_secret(&dir.join(file_name(key)), value.as_bytes())
@@ -155,7 +291,7 @@ impl Vault {
 
     pub fn delete(&self, key: &str) -> Result<()> {
         match self {
-            Vault::Keychain => KeychainItem::new(SERVICE, key).delete(),
+            Vault::Keychain => delete_value(&Keychain, key),
             Vault::Files(dir) => match std::fs::remove_file(dir.join(file_name(key))) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -172,6 +308,86 @@ fn file_name(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    /// An in-memory keychain; `fail_write: Some(n)` fails the write after n more.
+    #[derive(Default)]
+    struct Map {
+        items: RefCell<BTreeMap<String, String>>,
+        fail_write: RefCell<Option<usize>>,
+    }
+
+    impl Slots for Map {
+        fn read(&self, account: &str) -> Result<Option<String>> {
+            Ok(self.items.borrow().get(account).cloned())
+        }
+
+        fn write(&self, items: &[(String, String)]) -> Result<()> {
+            let mut fail = self.fail_write.borrow_mut();
+            match *fail {
+                Some(0) => bail!("write failed"),
+                Some(n) => *fail = Some(n - 1),
+                None => {}
+            }
+            for (k, v) in items {
+                // Each one has to fit a single `security -i` line.
+                KeychainItem::new(SERVICE, k).add_command(v).unwrap();
+                self.items.borrow_mut().insert(k.clone(), v.clone());
+            }
+            Ok(())
+        }
+
+        fn remove(&self, account: &str) -> Result<()> {
+            self.items.borrow_mut().remove(account);
+            Ok(())
+        }
+    }
+
+    /// About the size of a Codex `auth.json`.
+    fn big_login(tag: &str) -> String {
+        format!(
+            r#"{{"id_token":"{}","access_token":"{}","tag":"{tag}"}}"#,
+            "a".repeat(2600),
+            "b".repeat(2400)
+        )
+    }
+
+    #[test]
+    fn long_values_are_stored_in_pieces_that_fit_a_line() {
+        let slots = Map::default();
+        let count = || slots.items.borrow().len();
+        write_value(&slots, "profile:co-1", r#"{"small":true}"#).unwrap();
+        assert_eq!(count(), 1);
+        assert_eq!(read_value(&slots, "profile:co-1").unwrap().as_deref(), Some(r#"{"small":true}"#));
+
+        let big = big_login("one");
+        assert!(KeychainItem::new(SERVICE, "profile:co-1").add_command(&big).is_err());
+        write_value(&slots, "profile:co-1", &big).unwrap();
+        assert_eq!(count(), 1 + big.len().div_ceil(PIECE_BYTES));
+        assert_eq!(read_value(&slots, "profile:co-1").unwrap(), Some(big.clone()));
+
+        // Rewriting drops the previous pieces; so does going back to a short value.
+        write_value(&slots, "profile:co-1", &big_login("two")).unwrap();
+        assert_eq!(count(), 1 + big.len().div_ceil(PIECE_BYTES));
+        assert_eq!(read_value(&slots, "profile:co-1").unwrap(), Some(big_login("two")));
+        write_value(&slots, "profile:co-1", "{}").unwrap();
+        assert_eq!(count(), 1);
+
+        write_value(&slots, "profile:co-1", &big).unwrap();
+        delete_value(&slots, "profile:co-1").unwrap();
+        assert_eq!(count(), 0);
+    }
+
+    #[test]
+    fn an_interrupted_write_keeps_the_previous_value() {
+        let slots = Map::default();
+        write_value(&slots, "profile:co-1", &big_login("old")).unwrap();
+        // The new pieces land, then writing the header that names them fails.
+        *slots.fail_write.borrow_mut() = Some(1);
+        assert!(write_value(&slots, "profile:co-1", &big_login("new")).is_err());
+        assert_eq!(read_value(&slots, "profile:co-1").unwrap(), Some(big_login("old")));
+    }
 
     #[test]
     fn hex_decoding_only_for_text_payloads() {
