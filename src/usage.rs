@@ -1,0 +1,223 @@
+//! Usage meters: how much of each rate-limit window an account has used and
+//! when it resets — the thing you actually want to know when picking the next
+//! account.
+//!
+//! Best effort. We only query accounts whose short-lived access token is still
+//! valid (never refreshing, so we never rotate a token behind a CLI's back),
+//! only against the provider's own API host, and remember the last answer so
+//! idle accounts still show when their window resets.
+
+use crate::fsutil;
+use crate::providers::{AccessToken, Provider};
+use anyhow::{Result, bail};
+use chrono::{DateTime, TimeZone, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::mpsc::{self, Receiver};
+use std::time::Duration;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Window {
+    /// "5h", "7d", "7d opus", …
+    pub label: String,
+    /// Percent used, 0–100.
+    pub used: f64,
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Usage {
+    pub windows: Vec<Window>,
+    pub fetched_at: DateTime<Utc>,
+}
+
+impl Usage {
+    /// The window that limits the account the most right now. Windows whose
+    /// reset time has passed count as empty.
+    pub fn binding(&self) -> Option<Window> {
+        let now = Utc::now();
+        self.windows
+            .iter()
+            .map(|w| {
+                let mut w = w.clone();
+                if w.resets_at.is_some_and(|r| r <= now) {
+                    w.used = 0.0;
+                }
+                w
+            })
+            .max_by(|a, b| a.used.total_cmp(&b.used))
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Cache {
+    #[serde(flatten)]
+    pub by_profile: BTreeMap<String, Usage>,
+}
+
+impl Cache {
+    pub fn load(path: &Path) -> Self {
+        fsutil::read_optional(path)
+            .ok()
+            .flatten()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        fsutil::write_atomic(path, serde_json::to_string_pretty(self)?.as_bytes(), 0o600)
+    }
+}
+
+pub fn fetch(provider: Provider, tok: &AccessToken) -> Result<Usage> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(8)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let ua = concat!("accountant/", env!("CARGO_PKG_VERSION"));
+    let mut resp = match provider {
+        Provider::Claude => agent
+            .get("https://api.anthropic.com/api/oauth/usage")
+            .header("Authorization", &format!("Bearer {}", tok.token))
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .header("User-Agent", ua)
+            .call()?,
+        Provider::Codex => {
+            let mut req = agent
+                .get("https://chatgpt.com/backend-api/wham/usage")
+                .header("Authorization", &format!("Bearer {}", tok.token))
+                .header("User-Agent", ua);
+            if let Some(acct) = &tok.account_id {
+                req = req.header("ChatGPT-Account-Id", acct);
+            }
+            req.call()?
+        }
+    };
+    let status = resp.status().as_u16();
+    if status != 200 {
+        bail!("usage endpoint answered HTTP {status}");
+    }
+    let v: Value = resp.body_mut().read_json()?;
+    let windows = match provider {
+        Provider::Claude => parse_claude(&v),
+        Provider::Codex => parse_codex(&v),
+    };
+    if windows.is_empty() {
+        bail!("usage response had no windows");
+    }
+    Ok(Usage { windows, fetched_at: Utc::now() })
+}
+
+/// Fetch several accounts in parallel; results arrive as they complete.
+pub fn spawn_fetch(jobs: Vec<(String, Provider, AccessToken)>) -> Receiver<(String, Result<Usage>)> {
+    let (tx, rx) = mpsc::channel();
+    for (id, provider, tok) in jobs {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((id, fetch(provider, &tok)));
+        });
+    }
+    rx
+}
+
+fn parse_time(v: &Value) -> Option<DateTime<Utc>> {
+    match v {
+        Value::String(s) => DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc)),
+        Value::Number(n) => n.as_i64().and_then(|s| Utc.timestamp_opt(s, 0).single()),
+        _ => None,
+    }
+}
+
+/// `{"five_hour": {"utilization": 42.0, "resets_at": "…"}, "seven_day": {…}}`
+fn parse_claude(v: &Value) -> Vec<Window> {
+    let Some(obj) = v.as_object() else { return vec![] };
+    let mut out: Vec<Window> = obj
+        .iter()
+        .filter_map(|(k, w)| {
+            let used = w.get("utilization")?.as_f64()?;
+            let label = match k.as_str() {
+                "five_hour" => "5h".to_string(),
+                "seven_day" => "7d".to_string(),
+                other => other.replace("seven_day_", "7d ").replace('_', " "),
+            };
+            Some(Window { label, used, resets_at: w.get("resets_at").and_then(parse_time) })
+        })
+        .collect();
+    out.sort_by_key(|w| (w.label != "5h", w.label != "7d", w.label.clone()));
+    out
+}
+
+/// `{"rate_limit": {"primary_window": {"used_percent": 12, "limit_window_seconds": 18000,
+///   "reset_at": 1759…}, "secondary_window": {…}}}`
+fn parse_codex(v: &Value) -> Vec<Window> {
+    let rl = v.get("rate_limit").unwrap_or(v);
+    ["primary_window", "secondary_window"]
+        .iter()
+        .filter_map(|k| {
+            let w = rl.get(*k)?;
+            let used = w.get("used_percent")?.as_f64()?;
+            let secs = w.get("limit_window_seconds").and_then(Value::as_i64).unwrap_or(0);
+            let label = match secs {
+                0 => if *k == "primary_window" { "5h" } else { "7d" }.to_string(),
+                s if s % 86400 == 0 => format!("{}d", s / 86400),
+                s => format!("{}h", (s + 1800) / 3600),
+            };
+            let resets_at = w.get("reset_at").and_then(parse_time).or_else(|| {
+                let after = w.get("reset_after_seconds")?.as_i64()?;
+                Some(Utc::now() + chrono::Duration::seconds(after))
+            });
+            Some(Window { label, used, resets_at })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_claude_shape() {
+        let v = json!({
+            "seven_day": {"utilization": 30.0, "resets_at": "2026-10-10T00:00:00Z"},
+            "five_hour": {"utilization": 100.0, "resets_at": "2026-10-06T15:00:00+00:00"},
+            "seven_day_opus": {"utilization": 5.0, "resets_at": null},
+            "extra": null
+        });
+        let w = parse_claude(&v);
+        assert_eq!(w.iter().map(|w| w.label.as_str()).collect::<Vec<_>>(), ["5h", "7d", "7d opus"]);
+        assert_eq!(w[0].used, 100.0);
+        assert!(w[0].resets_at.is_some());
+    }
+
+    #[test]
+    fn parses_codex_shape() {
+        let v = json!({"plan_type": "plus", "rate_limit": {
+            "primary_window": {"used_percent": 64, "limit_window_seconds": 18000, "reset_after_seconds": 600},
+            "secondary_window": {"used_percent": 20, "limit_window_seconds": 604800, "reset_at": 1791288000}
+        }});
+        let w = parse_codex(&v);
+        assert_eq!(w[0].label, "5h");
+        assert_eq!(w[1].label, "7d");
+        assert_eq!(w[1].resets_at.unwrap().timestamp(), 1791288000);
+    }
+
+    #[test]
+    fn expired_windows_do_not_bind() {
+        let u = Usage {
+            windows: vec![
+                Window {
+                    label: "5h".into(),
+                    used: 100.0,
+                    resets_at: Some(Utc::now() - chrono::Duration::minutes(1)),
+                },
+                Window { label: "7d".into(), used: 40.0, resets_at: None },
+            ],
+            fetched_at: Utc::now(),
+        };
+        assert_eq!(u.binding().unwrap().label, "7d");
+    }
+}

@@ -1,0 +1,39 @@
+[package]
+name = "accountant"
+version = "0.1.0"
+edition = "2024"
+description = "Instant account switching for Claude Code and Codex"
+license = "MIT"
+default-run = "accountant"
+
+[[bin]]
+name = "accountant"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+clap = { version = "4.6", features = ["derive"] }
+getrandom = { version = "0.3", features = ["std"] }
+hex = "0.4"
+hmac = "0.12"
+mailparse = "0.16"
+ratatui = "0.30"
+regex = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha1 = "0.10"
+sha2 = "0.10"
+toml = "0.9"
+ureq = { version = "3", features = ["json"] }
+webpki-roots = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
