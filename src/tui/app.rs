@@ -167,6 +167,17 @@ pub struct Toast {
     pub at: Instant,
 }
 
+impl Toast {
+    /// Long enough to read: longer messages, and errors, stay up longer.
+    pub fn life(&self) -> Duration {
+        let mut secs = 3.0 + self.text.chars().count() as f32 / 14.0;
+        if self.kind == ToastKind::Bad {
+            secs *= 1.5;
+        }
+        Duration::from_secs_f32(secs.clamp(4.2, 20.0))
+    }
+}
+
 impl App {
     pub fn new(engine: Engine) -> Self {
         let mut app = App {
@@ -325,7 +336,7 @@ impl App {
         if let Some(m) = self.modal.take() {
             self.modal = self.tick_modal(m);
         }
-        if self.toast.as_ref().is_some_and(|t| t.at.elapsed() > Duration::from_millis(4200)) {
+        if self.toast.as_ref().is_some_and(|t| t.at.elapsed() > t.life()) {
             self.toast = None;
         }
     }
@@ -1330,6 +1341,68 @@ mod tests {
             for (w, h) in [(120, 40), (80, 24), (60, 18), (40, 12), (20, 6), (8, 3), (1, 1)] {
                 render(&app, w, h);
             }
+        }
+    }
+
+    const LONG_ERR: &str = "Claude Code: could not read the saved login for 'work': security: \
+        SecKeychainSearchCopyNext: The specified item could not be found in the keychain. (exit status 44) \
+        — run `accountant doctor` for details";
+
+    #[test]
+    fn long_errors_wrap_instead_of_being_cut_off() {
+        let (_d, mut app) = sandbox();
+        app.toast(ToastKind::Bad, LONG_ERR);
+        let home = render(&app, 100, 30);
+        assert!(home.contains("SecKeychainSearchCopyNext"), "{home}");
+        assert!(home.contains("for details"), "{home}");
+
+        let to = app.profiles()[1].clone();
+        app.toast = None;
+        app.modal = Some(Modal::Switch(Box::new(SwitchView {
+            sw: None,
+            provider: to.provider,
+            from_name: Some("work".into()),
+            to,
+            stage: 1,
+            stage_ran: true,
+            stage_started: Instant::now(),
+            started: Instant::now(),
+            phase: Phase::Failed(LONG_ERR.into()),
+            exit_at: None,
+            running: 0,
+        })));
+        app.modal_at = Instant::now() - Duration::from_secs(1);
+        let switch = render(&app, 100, 30);
+        assert!(switch.contains("for details"), "{switch}");
+        assert!(switch.contains("sign in again"), "{switch}");
+
+        let mut v = login_view(&app, None);
+        v.phase = Phase::Failed(LONG_ERR.into());
+        app.modal = Some(Modal::Login(v));
+        let login = render(&app, 100, 30);
+        assert!(login.contains("for details"), "{login}");
+    }
+
+    #[test]
+    fn usage_shows_every_window_and_when_it_resets() {
+        let (_d, mut app) = sandbox();
+        let now = Utc::now();
+        let window = |label: &str, used: f64, mins: i64| usage::Window {
+            label: label.into(),
+            used,
+            resets_at: Some(now + chrono::Duration::minutes(mins) + chrono::Duration::seconds(30)),
+        };
+        let ids: Vec<String> = app.profiles().iter().map(|p| p.id.clone()).collect();
+        let usage = |windows| Usage { windows, fetched_at: now };
+        app.usage
+            .by_profile
+            .insert(ids[0].clone(), usage(vec![window("5h", 100.0, 226), window("7d", 61.0, 4560)]));
+        app.usage
+            .by_profile
+            .insert(ids[1].clone(), usage(vec![window("5h", 42.0, 132), window("7d opus", 88.0, 7200)]));
+        let screen = render(&app, 100, 30);
+        for want in ["back in 3h 46m", "↻ in 3d 4h", "↻ in 2h 12m", "7d opus", "88%", "↻ in 5d"] {
+            assert!(screen.contains(want), "{want}:\n{screen}");
         }
     }
 

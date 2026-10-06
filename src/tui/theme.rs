@@ -8,6 +8,11 @@ pub const DIM: Color = Color::Rgb(128, 131, 148);
 pub const FAINT: Color = Color::Rgb(72, 75, 90);
 pub const GHOST: Color = Color::Rgb(44, 46, 56);
 pub const ROW_HL: Color = Color::Rgb(30, 32, 42);
+/// Raised surfaces: modal cards, and the keycaps in key hints.
+pub const CARD: Color = Color::Rgb(22, 23, 31);
+pub const KEYCAP: Color = Color::Rgb(46, 48, 62);
+/// What backgrounds fade towards when dimmed (a typical dark terminal).
+pub const SHADE: Color = Color::Rgb(18, 19, 25);
 pub const OK: Color = Color::Rgb(126, 211, 135);
 pub const WARN: Color = Color::Rgb(240, 184, 96);
 pub const ERR: Color = Color::Rgb(240, 104, 104);
@@ -108,18 +113,20 @@ pub fn noise(a: u64, b: u64) -> f32 {
     (x % 10_000) as f32 / 10_000.0
 }
 
-/// Human "in 1h 12m" / "3d" style durations.
+/// Human "1h 12m" / "3d 5h" style durations: the two largest units.
 pub fn short_duration(secs: i64) -> String {
     let s = secs.max(0);
+    let two = |big: i64, bu: &str, small: i64, su: &str| {
+        if small == 0 { format!("{big}{bu}") } else { format!("{big}{bu} {small}{su}") }
+    };
     if s < 60 {
         format!("{s}s")
     } else if s < 3600 {
         format!("{}m", s / 60)
     } else if s < 86_400 {
-        let (h, m) = (s / 3600, (s % 3600) / 60);
-        if m == 0 { format!("{h}h") } else { format!("{h}h{m:02}m") }
+        two(s / 3600, "h", (s % 3600) / 60, "m")
     } else {
-        format!("{}d", s / 86_400)
+        two(s / 86_400, "d", (s % 86_400) / 3600, "h")
     }
 }
 
@@ -139,9 +146,10 @@ mod tests {
     fn durations() {
         assert_eq!(short_duration(42), "42s");
         assert_eq!(short_duration(600), "10m");
-        assert_eq!(short_duration(3600 + 12 * 60), "1h12m");
+        assert_eq!(short_duration(3600 + 12 * 60), "1h 12m");
         assert_eq!(short_duration(7200), "2h");
         assert_eq!(short_duration(3 * 86_400 + 5), "3d");
+        assert_eq!(short_duration(3 * 86_400 + 5 * 3600 + 59), "3d 5h");
     }
 
     #[test]
