@@ -17,7 +17,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -225,21 +226,71 @@ pub mod claude {
             .context("saved Claude login has no credentials")?;
         let account = snap.get("oauthAccount").cloned().unwrap_or(Value::Null);
 
-        // Patch ~/.claude.json first: if it is unreadable we stop before
-        // touching the credentials, so the two never disagree.
-        let mut global = read_global(paths)?.unwrap_or_else(|| json!({}));
-        let obj = global.as_object_mut().context("~/.claude.json is not a JSON object")?;
-        if account.is_null() {
-            obj.remove("oauthAccount");
-        } else {
-            obj.insert("oauthAccount".into(), account);
-        }
-        let mut text = serde_json::to_string_pretty(&global)?;
-        text.push('\n');
+        // A running Claude Code rewrites ~/.claude.json all the time (project
+        // history, tips, counters). Read-modify-write it under Claude's own
+        // lock so neither side loses the other's change.
+        with_config_lock(&paths.claude_json, CONFIG_LOCK_WAIT, || {
+            // Patch ~/.claude.json first: if it is unreadable we stop before
+            // touching the credentials, so the two never disagree.
+            let mut global = read_global(paths)?.unwrap_or_else(|| json!({}));
+            let obj = global.as_object_mut().context("~/.claude.json is not a JSON object")?;
+            if account.is_null() {
+                obj.remove("oauthAccount");
+            } else {
+                obj.insert("oauthAccount".into(), account);
+            }
+            let mut text = serde_json::to_string_pretty(&global)?;
+            text.push('\n');
 
-        CredStore::detect(paths).set(creds)?;
-        fsutil::write_atomic(&paths.claude_json, text.as_bytes(), 0o600)?;
-        Ok(())
+            CredStore::detect(paths).set(creds)?;
+            fsutil::write_atomic(&paths.claude_json, text.as_bytes(), 0o600)
+        })
+    }
+
+    /// How long to wait for a Claude Code that holds its config lock.
+    const CONFIG_LOCK_WAIT: Duration = Duration::from_secs(6);
+    /// `proper-lockfile`'s default: a lock not refreshed for this long was
+    /// left behind by a process that died.
+    const CONFIG_LOCK_STALE: Duration = Duration::from_secs(10);
+
+    /// Claude Code guards `~/.claude.json` with `proper-lockfile`: a
+    /// `<file>.lock` directory that exists while the lock is held and is
+    /// touched every few seconds. Take it the same way.
+    pub(crate) fn with_config_lock<T>(
+        file: &Path,
+        wait: Duration,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let mut name = file.file_name().context("config path has no file name")?.to_os_string();
+        name.push(".lock");
+        let lock = file.with_file_name(name);
+        let started = Instant::now();
+        loop {
+            match std::fs::create_dir(&lock) {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&lock)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| SystemTime::now().duration_since(t).ok())
+                        .is_some_and(|age| age > CONFIG_LOCK_STALE);
+                    if stale {
+                        let _ = std::fs::remove_dir(&lock);
+                        continue;
+                    }
+                    if started.elapsed() > wait {
+                        bail!("Claude Code is busy updating {} — retry in a moment", file.display());
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                // No directory to lock in (first run): nothing to race with.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return f(),
+                Err(e) => return Err(e).with_context(|| format!("locking {}", file.display())),
+            }
+        }
+        let result = f();
+        let _ = std::fs::remove_dir(&lock);
+        result
     }
 
     fn read_global(paths: &Paths) -> Result<Option<Value>> {
@@ -486,6 +537,41 @@ pub mod tests {
         let id = codex::identity(&snap).unwrap();
         assert!(id.key.starts_with("codex:apikey:"));
         assert!(!id.key.contains("sk-test"));
+    }
+
+    #[test]
+    fn claude_config_is_patched_under_claude_codes_own_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".claude.json");
+        let lock = dir.path().join(".claude.json.lock");
+
+        // Claude holds the lock; we wait for it rather than writing over it.
+        std::fs::create_dir(&lock).unwrap();
+        let held = lock.clone();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            std::fs::remove_dir(&held).unwrap();
+        });
+        let started = Instant::now();
+        let saw_lock = claude::with_config_lock(&file, Duration::from_secs(5), || Ok(lock.exists())).unwrap();
+        release.join().unwrap();
+        assert!(saw_lock, "the closure runs while we hold the lock");
+        assert!(started.elapsed() >= Duration::from_millis(200), "waited for Claude");
+        assert!(!lock.exists(), "released afterwards");
+
+        // A lock nobody releases: give up with a clear error, change nothing.
+        std::fs::create_dir(&lock).unwrap();
+        let err = claude::with_config_lock(&file, Duration::from_millis(150), || -> Result<()> {
+            panic!("must not run without the lock")
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("busy"), "{err}");
+
+        // A lock left behind by a crashed process is taken over.
+        let old = SystemTime::now() - Duration::from_secs(60);
+        std::fs::File::open(&lock).unwrap().set_modified(old).unwrap();
+        assert!(claude::with_config_lock(&file, Duration::from_millis(150), || Ok(true)).unwrap());
+        assert!(!lock.exists());
     }
 
     #[test]
