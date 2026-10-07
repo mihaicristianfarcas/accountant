@@ -151,6 +151,9 @@ fn report_switch(e: &Engine, done: &engine::Switched) {
             )
         );
     }
+    if let Some(note) = credential_env_note(provider) {
+        println!("  {} {note}", paint("33", "!"));
+    }
 }
 
 pub fn use_account(who: &str, provider: Option<&str>) -> Result<()> {
@@ -477,6 +480,27 @@ fn version_of(bin: &str) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// "ANTHROPIC_API_KEY is set: …", when this shell would not use the switched login.
+pub fn credential_env_note(provider: Provider) -> Option<String> {
+    let set = provider.credential_env_set();
+    if set.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} {} set in this shell: `{}` started here uses {} instead of the switched account",
+        set.join(", "),
+        if set.len() == 1 { "is" } else { "are" },
+        provider.process_name(),
+        if set.len() == 1 { "it" } else { "them" },
+    ))
+}
+
+fn credential_env_warning(provider: Provider, warn: &impl Fn(&str)) {
+    if let Some(note) = credential_env_note(provider) {
+        warn(&note);
+    }
+}
+
 pub fn doctor() -> Result<()> {
     let e = Engine::open()?;
     let ok = |s: &str| println!("  {} {s}", paint("32", "✓"));
@@ -498,6 +522,7 @@ pub fn doctor() -> Result<()> {
     if let Some(dir) = &e.paths.claude_store {
         info(&format!("custom store {dir} (followed automatically)"));
     }
+    credential_env_warning(Provider::Claude, &warn);
     match e.live(Provider::Claude) {
         Ok(Some((_, id))) => ok(&format!(
             "signed in as {}",
@@ -518,6 +543,7 @@ pub fn doctor() -> Result<()> {
             "config.toml stores Codex credentials in the keyring; set cli_auth_credentials_store = \"file\" for switching",
         );
     }
+    credential_env_warning(Provider::Codex, &warn);
     match e.live(Provider::Codex) {
         Ok(Some((_, id))) => ok(&format!(
             "signed in as {}",

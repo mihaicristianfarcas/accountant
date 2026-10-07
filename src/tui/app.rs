@@ -1189,6 +1189,9 @@ fn farewell_lines(p: &Profile, already: bool, running: usize) -> Vec<String> {
             if running == 1 { "" } else { "s" }
         ));
     }
+    if let Some(note) = crate::cli::credential_env_note(p.provider) {
+        lines.push(format!("  \x1b[33m!\x1b[0m \x1b[2m{note}\x1b[0m"));
+    }
     lines
 }
 

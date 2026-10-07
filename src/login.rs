@@ -129,6 +129,11 @@ fn spawn_claude(email: Option<&str>) -> Result<ClaudeChild> {
     if let Some(e) = email.filter(|e| !e.is_empty()) {
         cmd.args(["--email", e]);
     }
+    // An API key or token in the environment would stand in for the
+    // subscription login being created here.
+    for key in Provider::Claude.credential_env() {
+        cmd.env_remove(key);
+    }
     cmd.env("BROWSER", &shim)
         .env("ACCOUNTANT_URL_FILE", &url_file)
         .stdin(Stdio::piped())

@@ -57,6 +57,31 @@ impl Provider {
         self.slug()
     }
 
+    /// Environment variables that make the CLI use something other than its
+    /// saved login. A shell exporting one keeps that account (or API key)
+    /// whatever accountant switches to.
+    pub fn credential_env(self) -> &'static [&'static str] {
+        match self {
+            Provider::Claude => &[
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_VERTEX",
+            ],
+            Provider::Codex => &["OPENAI_API_KEY", "CODEX_API_KEY"],
+        }
+    }
+
+    /// The [`credential_env`](Self::credential_env) variables set right now.
+    pub fn credential_env_set(self) -> Vec<&'static str> {
+        self.credential_env()
+            .iter()
+            .copied()
+            .filter(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+            .collect()
+    }
+
     /// Substrings of sender addresses that send this provider's login codes.
     pub fn mail_senders(self) -> &'static [&'static str] {
         match self {
