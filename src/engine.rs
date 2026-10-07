@@ -57,6 +57,8 @@ pub struct Switch {
     pub from: Option<String>,
     pub already_active: bool,
     snapshot: Option<Snapshot>,
+    /// The live login as the Save stage stored it.
+    saved: Option<Snapshot>,
     _lock: Lock,
 }
 
@@ -219,7 +221,17 @@ impl Engine {
     }
 
     fn sync_back_locked(&mut self, provider: Provider) -> Result<Synced> {
-        let Some((snap, ident)) = self.live(provider)? else {
+        let live = self.live(provider)?;
+        self.store_live_locked(provider, live)
+    }
+
+    /// Save a live login that was just read into its profile.
+    fn store_live_locked(
+        &mut self,
+        provider: Provider,
+        live: Option<(Snapshot, Identity)>,
+    ) -> Result<Synced> {
+        let Some((snap, ident)) = live else {
             return Ok(Synced::NothingLive);
         };
         // The exact credentials of a saved profile whose account metadata
@@ -268,6 +280,7 @@ impl Engine {
             from: None,
             already_active: false,
             snapshot: None,
+            saved: None,
             _lock: lock,
         })
     }
@@ -275,7 +288,9 @@ impl Engine {
     pub fn run_stage(&mut self, sw: &mut Switch, stage: Stage) -> Result<()> {
         match stage {
             Stage::Save => {
-                let synced = self.sync_back_locked(sw.provider)?;
+                let live = self.live(sw.provider)?;
+                sw.saved = live.as_ref().map(|(s, _)| s.clone());
+                let synced = self.store_live_locked(sw.provider, live)?;
                 match synced.profile_id() {
                     Some(id) if id == sw.target => sw.already_active = true,
                     Some(id) => sw.from = Some(id.to_string()),
@@ -292,6 +307,13 @@ impl Engine {
             }
             Stage::Swap => {
                 if !sw.already_active {
+                    // The CLI may have refreshed (and so rotated) its tokens
+                    // since Save. Keep the newer copy too, right before it is
+                    // replaced, or that account's saved login is already dead.
+                    let live = self.live(sw.provider)?;
+                    if live.as_ref().map(|(s, _)| s) != sw.saved.as_ref() {
+                        self.store_live_locked(sw.provider, live)?;
+                    }
                     let snap = sw.snapshot.as_ref().context("nothing loaded")?;
                     providers::write_live(sw.provider, &self.paths, snap)?;
                 }
@@ -504,6 +526,28 @@ mod tests {
         e.switch(&b).unwrap();
         let live = std::fs::read_to_string(e.paths.codex_auth()).unwrap();
         assert!(live.contains("rt-ub-2"));
+    }
+
+    #[test]
+    fn tokens_rotated_during_a_switch_are_kept() {
+        let (_d, mut e) = sandbox();
+        put_codex_live(&e, &fake_codex_auth("a@x.com", "ua", "acct-a", "plus"));
+        let (a, _) = e.save_current(Provider::Codex, None).unwrap().unwrap();
+        put_codex_live(&e, &fake_codex_auth("b@x.com", "ub", "acct-b", "pro"));
+        let (b, _) = e.save_current(Provider::Codex, None).unwrap().unwrap();
+
+        let mut sw = e.begin_switch(&a).unwrap();
+        e.run_stage(&mut sw, Stage::Save).unwrap();
+        // Codex refreshes b's login while the switch is under way.
+        let rotated = fake_codex_auth("b@x.com", "ub", "acct-b", "pro").replace("rt-ub", "rt-ub-late");
+        put_codex_live(&e, &rotated);
+        for stage in [Stage::Load, Stage::Swap, Stage::Verify] {
+            e.run_stage(&mut sw, stage).unwrap();
+        }
+        drop(sw);
+        let saved = e.snapshot(&b).unwrap().unwrap();
+        assert!(saved["auth"].as_str().unwrap().contains("rt-ub-late"), "the newer tokens were saved");
+        assert_eq!(e.active_id(Provider::Codex).as_deref(), Some(a.as_str()));
     }
 
     #[test]
