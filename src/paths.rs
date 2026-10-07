@@ -12,6 +12,10 @@ pub struct Paths {
     pub claude_dir: PathBuf,
     /// Claude Code global config file holding `oauthAccount`.
     pub claude_json: PathBuf,
+    /// The directory Claude Code keys its credential store by, exactly as
+    /// given (`$CLAUDE_SECURESTORAGE_CONFIG_DIR`, else `$CLAUDE_CONFIG_DIR`);
+    /// `None` for the default store.
+    pub claude_store: Option<String>,
     /// Codex home (`$CODEX_HOME` or `~/.codex`).
     pub codex_home: PathBuf,
 }
@@ -33,9 +37,15 @@ impl Paths {
             None => (home.join(".claude"), home.join(".claude.json")),
         };
 
+        // Set but empty pins the default store, as in Claude Code.
+        let claude_store = match env::var("CLAUDE_SECURESTORAGE_CONFIG_DIR") {
+            Ok(dir) => Some(dir).filter(|d| !d.is_empty()),
+            Err(_) => env::var("CLAUDE_CONFIG_DIR").ok().filter(|d| !d.is_empty()),
+        };
+
         let codex_home = env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
 
-        Paths { data, claude_dir, claude_json, codex_home }
+        Paths { data, claude_dir, claude_json, claude_store, codex_home }
     }
 
     pub fn registry(&self) -> PathBuf {
@@ -63,6 +73,9 @@ impl Paths {
     }
 
     pub fn claude_credentials_file(&self) -> PathBuf {
-        self.claude_dir.join(".credentials.json")
+        self.claude_store
+            .as_ref()
+            .map_or_else(|| self.claude_dir.clone(), PathBuf::from)
+            .join(".credentials.json")
     }
 }

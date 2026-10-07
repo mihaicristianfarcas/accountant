@@ -485,6 +485,7 @@ mod tests {
             data: root.join("data"),
             claude_dir: root.join(".claude"),
             claude_json: root.join(".claude.json"),
+            claude_store: None,
             codex_home: root.join(".codex"),
         };
         std::fs::create_dir_all(&paths.claude_dir).unwrap();

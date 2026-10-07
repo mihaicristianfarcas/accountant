@@ -495,10 +495,8 @@ pub fn doctor() -> Result<()> {
     }
     info(&format!("credentials  {}", providers::claude::CredStore::detect(&e.paths).describe()));
     info(&format!("account file {}", e.paths.claude_json.display()));
-    if std::env::var_os("CLAUDE_CONFIG_DIR").is_some() && cfg!(target_os = "macos") {
-        warn(
-            "CLAUDE_CONFIG_DIR is set: Claude Code then uses a different Keychain item — set ACCOUNTANT_CLAUDE_KEYCHAIN_SERVICE to match",
-        );
+    if let Some(dir) = &e.paths.claude_store {
+        info(&format!("custom store {dir} (followed automatically)"));
     }
     match e.live(Provider::Claude) {
         Ok(Some((_, id))) => ok(&format!(

@@ -162,6 +162,16 @@ pub mod claude {
 
     pub const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
+    /// The Keychain item Claude Code uses for a credential directory: the
+    /// default name, or (for a custom directory) the name suffixed with the
+    /// first 8 hex digits of the SHA-256 of the directory string as given.
+    pub fn keychain_service(store: Option<&str>) -> String {
+        match store {
+            None => KEYCHAIN_SERVICE.to_string(),
+            Some(dir) => format!("{KEYCHAIN_SERVICE}-{}", &hex::encode(Sha256::digest(dir.as_bytes()))[..8]),
+        }
+    }
+
     /// Where Claude Code keeps its OAuth credentials on this machine.
     #[derive(Debug, Clone)]
     pub enum CredStore {
@@ -176,7 +186,7 @@ pub mod claude {
                 return CredStore::File(paths.claude_credentials_file());
             }
             let service = std::env::var("ACCOUNTANT_CLAUDE_KEYCHAIN_SERVICE")
-                .unwrap_or_else(|_| KEYCHAIN_SERVICE.to_string());
+                .unwrap_or_else(|_| keychain_service(paths.claude_store.as_deref()));
             let account = std::env::var("USER").unwrap_or_else(|_| "claude".into());
             CredStore::Keychain(KeychainItem::new(service, account))
         }
@@ -537,6 +547,16 @@ pub mod tests {
         let id = codex::identity(&snap).unwrap();
         assert!(id.key.starts_with("codex:apikey:"));
         assert!(!id.key.contains("sk-test"));
+    }
+
+    #[test]
+    fn custom_claude_config_dirs_use_claude_codes_own_keychain_item() {
+        assert_eq!(claude::keychain_service(None), "Claude Code-credentials");
+        // printf '%s' /Users/me/.claude-work | shasum -a 256
+        assert_eq!(
+            claude::keychain_service(Some("/Users/me/.claude-work")),
+            "Claude Code-credentials-1e91dd84"
+        );
     }
 
     #[test]
