@@ -102,6 +102,11 @@ pub fn fetch(provider: Provider, tok: &AccessToken) -> Result<Usage> {
         }
     };
     let status = resp.status().as_u16();
+    // We only ask with an access token that has not expired, so a 401 means
+    // the provider revoked the whole session.
+    if status == 401 {
+        return Err(Revoked.into());
+    }
     if status != 200 {
         bail!("usage endpoint answered HTTP {status}");
     }
@@ -115,6 +120,18 @@ pub fn fetch(provider: Provider, tok: &AccessToken) -> Result<Usage> {
     }
     Ok(Usage { windows, fetched_at: Utc::now() })
 }
+
+/// The provider no longer accepts the saved login: a browser sign-in is due.
+#[derive(Debug)]
+pub struct Revoked;
+
+impl std::fmt::Display for Revoked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the provider no longer accepts this login — sign in again")
+    }
+}
+
+impl std::error::Error for Revoked {}
 
 /// Fetch several accounts in parallel; results arrive as they complete.
 pub fn spawn_fetch(jobs: Vec<(String, Provider, AccessToken)>) -> Receiver<(String, Result<Usage>)> {
@@ -142,10 +159,38 @@ fn is_window_label(label: &str) -> bool {
     len.len() >= 2 && len.ends_with(['h', 'd']) && len[..len.len() - 1].bytes().all(|b| b.is_ascii_digit())
 }
 
-/// `{"five_hour": {"utilization": 42.0, "resets_at": "…"}, "seven_day": {…}}`.
+/// The current shape, `{"limits": [{"kind": "session", "percent": 42, "resets_at": "…"},
+/// {"kind": "weekly_scoped", "scope": {"model": {"display_name": "Opus"}}, …}]}`,
+/// or the older `{"five_hour": {"utilization": 42.0, "resets_at": "…"}, "seven_day": {…}}`.
 /// Only the rate-limit windows: the response also carries other objects that
 /// have a `utilization` but are not limits you can run into.
 fn parse_claude(v: &Value) -> Vec<Window> {
+    let modern: Vec<Window> = v
+        .get("limits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let label = match entry.get("kind")?.as_str()? {
+                "session" => "5h".to_string(),
+                "weekly_all" => "7d".to_string(),
+                "weekly_scoped" => {
+                    let model = entry
+                        .pointer("/scope/model/display_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("model")
+                        .to_lowercase();
+                    format!("7d {model}")
+                }
+                _ => return None,
+            };
+            let used = entry.get("percent")?.as_f64().filter(|p| p.is_finite())?;
+            Some(Window { label, used, resets_at: entry.get("resets_at").and_then(parse_time) })
+        })
+        .collect();
+    if !modern.is_empty() {
+        return modern;
+    }
     let Some(obj) = v.as_object() else { return vec![] };
     let mut out: Vec<Window> = obj
         .iter()
@@ -165,20 +210,33 @@ fn parse_claude(v: &Value) -> Vec<Window> {
 }
 
 /// `{"rate_limit": {"primary_window": {"used_percent": 12, "limit_window_seconds": 18000,
-///   "reset_at": 1759…}, "secondary_window": {…}}}`
+///   "reset_at": 1759…}, "secondary_window": {…}}, "additional_rate_limits": [{"limit_name":
+///   "GPT-5-Codex-Mini", "rate_limit": {…}}]}`. Model-specific limits get the model as qualifier.
 fn parse_codex(v: &Value) -> Vec<Window> {
-    let rl = v.get("rate_limit").unwrap_or(v);
+    let mut out = codex_windows(v.get("rate_limit").unwrap_or(v), None);
+    for extra in v.get("additional_rate_limits").and_then(Value::as_array).into_iter().flatten() {
+        let Some(rl) = extra.get("rate_limit") else { continue };
+        let name = extra.get("limit_name").and_then(Value::as_str).map(str::to_lowercase);
+        out.extend(codex_windows(rl, name.as_deref()));
+    }
+    out
+}
+
+fn codex_windows(rl: &Value, qualifier: Option<&str>) -> Vec<Window> {
     ["primary_window", "secondary_window"]
         .iter()
         .filter_map(|k| {
             let w = rl.get(*k)?;
             let used = w.get("used_percent")?.as_f64()?;
             let secs = w.get("limit_window_seconds").and_then(Value::as_i64).unwrap_or(0);
-            let label = match secs {
+            let mut label = match secs {
                 0 => if *k == "primary_window" { "5h" } else { "7d" }.to_string(),
                 s if s % 86400 == 0 => format!("{}d", s / 86400),
                 s => format!("{}h", (s + 1800) / 3600),
             };
+            if let Some(q) = qualifier.filter(|q| !q.is_empty()) {
+                label = format!("{label} {q}");
+            }
             let resets_at = w.get("reset_at").and_then(parse_time).or_else(|| {
                 let after = w.get("reset_after_seconds")?.as_i64()?;
                 Some(Utc::now() + chrono::Duration::seconds(after))
@@ -206,6 +264,35 @@ mod tests {
         assert_eq!(w.iter().map(|w| w.label.as_str()).collect::<Vec<_>>(), ["5h", "7d", "7d opus"]);
         assert_eq!(w[0].used, 100.0);
         assert!(w[0].resets_at.is_some());
+    }
+
+    #[test]
+    fn parses_claudes_current_limits_list_the_same_as_the_old_shape() {
+        let v = json!({"limits": [
+            {"kind": "session", "percent": 37, "resets_at": "2026-10-06T15:00:00Z"},
+            {"kind": "weekly_all", "percent": 12.5, "resets_at": "2026-10-10T00:00:00Z"},
+            {"kind": "weekly_scoped", "percent": 80, "scope": {"model": {"display_name": "Opus"}}},
+            {"kind": "something_new", "percent": 1}
+        ]});
+        let w = parse_claude(&v);
+        assert_eq!(w.iter().map(|w| w.label.as_str()).collect::<Vec<_>>(), ["5h", "7d", "7d opus"]);
+        assert_eq!(w[0].used, 37.0);
+        let old =
+            parse_claude(&json!({"five_hour": {"utilization": 37.0, "resets_at": "2026-10-06T15:00:00Z"}}));
+        assert_eq!(old[0], w[0]);
+    }
+
+    #[test]
+    fn codex_model_specific_limits_are_kept_with_their_model() {
+        let v = json!({
+            "rate_limit": {"primary_window": {"used_percent": 10, "limit_window_seconds": 18000}},
+            "additional_rate_limits": [{"limit_name": "GPT-5-Codex-Mini",
+                "rate_limit": {"primary_window": {"used_percent": 90, "limit_window_seconds": 18000}}}]
+        });
+        let w = parse_codex(&v);
+        assert_eq!(w.iter().map(|w| w.label.as_str()).collect::<Vec<_>>(), ["5h", "5h gpt-5-codex-mini"]);
+        assert!(w.iter().all(|w| is_window_label(&w.label)), "they survive the cache");
+        assert_eq!(Usage { windows: w, fetched_at: Utc::now() }.binding().unwrap().used, 90.0);
     }
 
     #[test]

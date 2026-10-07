@@ -323,14 +323,25 @@ impl App {
     pub fn tick(&mut self) {
         if let Some(rx) = &self.usage_rx {
             let mut changed = false;
+            let mut revoked = vec![];
             while let Ok((id, res)) = rx.try_recv() {
-                if let Ok(u) = res {
-                    self.usage.by_profile.insert(id, u);
-                    changed = true;
+                match res {
+                    Ok(u) => {
+                        self.usage.by_profile.insert(id, u);
+                        changed = true;
+                    }
+                    Err(e) if e.is::<usage::Revoked>() => revoked.push(id),
+                    Err(_) => {}
                 }
             }
             if changed {
                 let _ = self.usage.save(&self.engine.paths.usage_cache());
+            }
+            // Say so now, not when the switch to it fails.
+            for id in revoked {
+                if self.engine.registry.get(&id).is_some_and(|p| !p.needs_login) {
+                    let _ = self.engine.set_needs_login(&id, true);
+                }
             }
         }
         if let Some(m) = self.modal.take() {
