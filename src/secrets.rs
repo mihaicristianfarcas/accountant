@@ -17,14 +17,82 @@ use crate::fsutil;
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+const SECURITY: &str = "/usr/bin/security";
 
 pub const SERVICE: &str = "accountant";
 
 /// Longest command line `security -i` takes whole.
 const LINE_MAX: usize = 4000;
+
+/// How long `security` may take. A locked keychain makes it wait for the
+/// unlock dialog, so this leaves time to type a password, but a dialog nobody
+/// answers no longer freezes accountant for good.
+const SECURITY_TIMEOUT: Duration = Duration::from_secs(60);
+
+struct Finished {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Run `security` with `stdin` (if any) and wait for it at most
+/// [`SECURITY_TIMEOUT`]. A child that overruns is killed and reaped.
+fn run_security(args: &[&str], stdin: Option<&[u8]>) -> Result<Finished> {
+    run_bounded(Command::new(SECURITY).args(args), stdin, SECURITY_TIMEOUT)
+}
+
+fn run_bounded(cmd: &mut Command, stdin: Option<&[u8]>, timeout: Duration) -> Result<Finished> {
+    let mut child = cmd
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running `security` (macOS Keychain)")?;
+    // Drain both pipes on their own threads so a chatty child never blocks on
+    // a full pipe while we wait for it to exit.
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut out);
+            }
+            out
+        })
+    }
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        let written = pipe.write_all(input);
+        drop(pipe);
+        if let Err(e) = written {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e).context("writing to `security`");
+        }
+    }
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("the Keychain did not answer — unlock the login keychain and retry");
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    Ok(Finished {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
 
 /// A generic-password slot in the macOS Keychain.
 #[derive(Debug, Clone)]
@@ -44,11 +112,8 @@ impl KeychainItem {
 
     /// The value exactly as `security -w` prints it.
     fn get_raw(&self) -> Result<Option<String>> {
-        let out = Command::new("security")
-            .args(["find-generic-password", "-s", &self.service, "-a", &self.account, "-w"])
-            .stdin(Stdio::null())
-            .output()
-            .context("running `security` (macOS Keychain)")?;
+        let out =
+            run_security(&["find-generic-password", "-s", &self.service, "-a", &self.account, "-w"], None)?;
         match out.status.code() {
             Some(0) => {}
             // errSecItemNotFound
@@ -90,13 +155,8 @@ impl KeychainItem {
     }
 
     pub fn delete(&self) -> Result<()> {
-        let out = Command::new("security")
-            .args(["delete-generic-password", "-s", &self.service, "-a", &self.account])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        match out.code() {
+        let out = run_security(&["delete-generic-password", "-s", &self.service, "-a", &self.account], None)?;
+        match out.status.code() {
             Some(0) | Some(44) => Ok(()),
             _ => bail!("keychain delete failed for '{}'", self.service),
         }
@@ -105,19 +165,7 @@ impl KeychainItem {
 
 /// Run `add-generic-password` commands through one `security -i`.
 fn security_batch(service: &str, lines: &[String]) -> Result<()> {
-    let mut child = Command::new("security")
-        .arg("-i")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("running `security` (macOS Keychain)")?;
-    let mut stdin = child.stdin.take().unwrap();
-    for line in lines {
-        stdin.write_all(line.as_bytes())?;
-    }
-    drop(stdin);
-    let out = child.wait_with_output()?;
+    let out = run_security(&["-i"], Some(lines.concat().as_bytes()))?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     if !out.status.success() || stderr.contains("error") || stderr.contains("unknown command") {
         bail!("keychain write failed for '{service}': {}", stderr.trim());
@@ -396,6 +444,27 @@ mod tests {
         // A base32 TOTP secret or a plain token must pass through untouched.
         assert_eq!(decode_if_hex("JBSWY3DPEHPK3PXP".into()), "JBSWY3DPEHPK3PXP");
         assert_eq!(decode_if_hex("deadbeef".into()), "deadbeef");
+    }
+
+    #[test]
+    fn a_child_that_never_answers_is_killed_not_waited_for_forever() {
+        let started = Instant::now();
+        let err = run_bounded(Command::new("/bin/sleep").arg("30"), None, Duration::from_millis(200))
+            .err()
+            .expect("timed out");
+        assert!(err.to_string().contains("unlock the login keychain"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // Output larger than a pipe buffer still arrives whole.
+        let out = run_bounded(
+            Command::new("/bin/sh").args(["-c", "head -c 200000 /dev/zero; cat"]),
+            Some(b"tail"),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len(), 200_004);
+        assert!(out.stdout.ends_with(b"tail"));
     }
 
     #[test]
