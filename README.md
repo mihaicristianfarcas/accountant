@@ -167,12 +167,28 @@ hide_emails = false        # mask addresses for screenshots / recordings (p)
   - Nothing else leaves the machine.
 - Use it with accounts you own, within each provider's terms.
 
+## Safe alongside a running CLI
+
+- **Claude Code's config lock.** `~/.claude.json` is rewritten by every running Claude Code. accountant
+  patches `oauthAccount` under Claude Code's own lock (the `proper-lockfile` directory beside the file),
+  so neither side loses the other's change.
+- **Tokens that rotate mid-switch.** If a CLI refreshes its login between the *save* and *swap* steps,
+  the newer tokens are saved too before the swap.
+- **A Keychain that does not answer** (locked, dialog left open) times out with a clear message instead
+  of freezing the switcher.
+- **Revoked sessions are spotted early.** When a provider rejects a still-valid token while reading
+  usage, the account is marked *needs sign-in* right away, not when you try to switch to it.
+
 ## Caveats
 
 - Running `claude` / `codex` sessions keep the old login in memory. accountant tells you how many are
   running; restart them to pick up the new account.
-- With `CLAUDE_CONFIG_DIR` set, Claude Code uses a differently named Keychain item. Point
-  `ACCOUNTANT_CLAUDE_KEYCHAIN_SERVICE` at it.
+- An API key or token in the environment (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
+  `OPENAI_API_KEY`, …) makes the CLI ignore the switched login. accountant warns when one is set and
+  keeps them out of the sign-ins it runs.
+- With `CLAUDE_CONFIG_DIR` (or `CLAUDE_SECURESTORAGE_CONFIG_DIR`) set, Claude Code keeps its login in a
+  Keychain item named after that directory; accountant follows it. `ACCOUNTANT_CLAUDE_KEYCHAIN_SERVICE`
+  still overrides the item name.
 - Codex configured with `cli_auth_credentials_store = "keyring"` is not supported. Use the default file
   store.
 - `accountant doctor` checks all of the above.
@@ -190,7 +206,7 @@ Every location can be redirected, which is how the tests and a manual sandbox ru
 | `ACCOUNTANT_HOME` | accountant's state directory |
 | `ACCOUNTANT_SECRETS=file` | file vault instead of the Keychain |
 | `ACCOUNTANT_CLAUDE_CREDENTIALS=file` | Claude Code credentials from `.credentials.json` |
-| `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HOME` | where the CLIs' files are |
+| `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`, `CODEX_HOME`, `HOME` | where the CLIs' files are |
 | `ACCOUNTANT_CLAUDE_BIN` | the `claude` executable used for sign-in |
 | `ACCOUNTANT_BROWSER_CMD` | custom browser command |
 | `ACCOUNTANT_CODEX_ISSUER` | OAuth issuer, e.g. a local fake |
