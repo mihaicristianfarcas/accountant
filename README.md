@@ -7,7 +7,8 @@
 ```
 
 Instant account switching for **Claude Code**, **Codex**, **OpenCode**, **Antigravity**, **Cursor** and
-**GitHub Copilot CLI**. When you hit a usage limit:
+**GitHub Copilot CLI**. Keep your personal and work accounts signed in side by side, and move between them
+without signing out. When you hit a usage limit:
 
 ```
 accountant      →  ⏎      →  ready to go
@@ -49,6 +50,56 @@ login is never thrown away: accounts you signed into outside accountant are adop
    ✓ swapping credentials        → Keychain / auth.json, patch ~/.claude.json
    ✓ verifying                   live login is personal
 ```
+
+## Is this allowed?
+
+That is for each provider's terms to say, and they change, so read the current ones for the tools you use.
+Below is what a provider can see when you use accountant, and where the risk of a suspension lies. It was
+checked in October 2026 and is not legal advice.
+
+**A switch looks like signing out and back in.** Afterwards, the official CLI or app talks to its provider
+with its own login, exactly as if you had signed in by hand. accountant modifies no tool and forges no
+request. It doesn't hide that the accounts are yours, either:
+
+- They come from one machine: the same IP address, and the same install and device IDs. accountant
+  replaces only the login, never the IDs a tool keeps for the machine.
+- The timing shows it: one account reaches its limit, and another carries on minutes later.
+- With usage meters on, accountant itself asks Anthropic and OpenAI about all your Claude Code and Codex
+  accounts at once, under its own name (see [Usage](#usage)).
+- A Codex sign-in uses Codex's own OAuth client, so OpenAI sees Codex signing in.
+
+Assume a provider can tell that your accounts belong to one person.
+
+**The risk is in why you have several accounts**, not in how you switch between them:
+
+| | |
+|---|---|
+| Personal and work accounts | Low. Switching only saves you signing out and back in. |
+| Several plans of your own, used one after another to keep working past usage limits | Neither clearly allowed nor forbidden. Anthropic says the limits of Pro and Max "assume ordinary, individual usage", and some people with several Max plans reported suspensions in February 2026. OpenAI's terms forbid circumventing "any rate limits or restrictions". accountant makes this easy, but whether it's allowed is between you and the provider. |
+| Accounts shared with other people or resold, or new free accounts to reset a limit | Against the terms of every provider here. GitHub allows one free personal account per person, and Cursor counts free accounts per machine. |
+
+Some points are specific to one tool:
+
+- **Claude logins in accountant.** Anthropic's Claude Code docs say developers "may not collect, store, or
+  intermediate Claude.ai credentials or session tokens". accountant keeps its copies only in your own
+  Keychain, signs in only through Claude Code's own flow, and sends a token nowhere but Anthropic, but it
+  does store them. The usage meters are the one place accountant itself uses a Claude login: a read-only
+  request for that account's usage. Turn them off if you'd rather it didn't.
+- **Claude logins in OpenCode.** The same docs say Pro and Max logins are meant for "Claude Code and other
+  native Anthropic applications", which leaves out third-party tools such as OpenCode. accountant can switch
+  such a login, but it can't make that use allowed. Google logins in third-party tools carry the same risk:
+  Google suspended Antigravity accounts used that way in 2026.
+- **Antigravity itself.** Those suspensions hit logins used outside Google's apps. accountant hands the
+  login to Antigravity, the app it belongs to.
+
+accountant won't make your accounts look like different machines or people: no altered device IDs, no
+proxies. That would be evading the providers' abuse checks, not switching accounts.
+
+Terms: [Anthropic](https://www.anthropic.com/legal/consumer-terms) and
+[Claude Code](https://code.claude.com/docs/en/legal-and-compliance) ·
+[OpenAI](https://openai.com/policies/terms-of-use/) ·
+[GitHub](https://docs.github.com/en/site-policy/github-terms/github-terms-of-service) ·
+[Cursor](https://cursor.com/terms-of-service) · [Google Antigravity](https://antigravity.google/terms)
 
 ## Install
 
@@ -151,9 +202,21 @@ Each row shows an account's usage, when known:
 - `◷ 1h12m 5h`: limited, with the time until the window resets.
 - `✓ reset · ready`: the window has reset since it was last seen.
 
-Meters are best effort, and for now only Claude Code and Codex have them. accountant only queries accounts
-whose short-lived access token is still valid, never refreshes tokens to do so, and talks only to each
-provider's own API host.
+Meters are best effort, and for now only Claude Code and Codex have them. They are on by default
+(`usage = true`). Here is what that does:
+
+- **When:** as the switcher opens, after each switch or sign-in, and when you press <kbd>u</kbd>.
+  `accountant ls` and `status` show the last answers and ask nothing.
+- **What:** one request per account, all at once, to the provider's own usage endpoint
+  (`api.anthropic.com/api/oauth/usage`, `chatgpt.com/backend-api/wham/usage`). Each request carries that
+  account's access token and `User-Agent: accountant/<version>`. accountant only asks for accounts whose
+  short-lived access token is still valid, and never refreshes a token to do so.
+- **What the provider learns:** that accountant, from your IP address, checked each of these accounts at
+  the same moment, which ties them to one another (see [Is this allowed?](#is-this-allowed)).
+
+To turn them off, set *usage meters* to off in settings (<kbd>,</kbd>), or `usage = false` in the config.
+accountant itself then never talks to Anthropic, and talks to OpenAI only for a Codex sign-in. You also
+lose the early warning for revoked sessions (see [Safe alongside a running CLI](#safe-alongside-a-running-cli)).
 
 The list shows Claude Code and Codex always, and the other tools once they have an account.
 
@@ -190,7 +253,7 @@ imap_folder = "INBOX"
 
 [ui]
 auto_exit = true           # quit right after a successful switch
-usage = true               # usage meters
+usage = true               # usage meters; what they send is under Usage
 reduced_motion = false
 hide_emails = false        # mask addresses for screenshots / recordings (p)
 ```
@@ -212,7 +275,7 @@ hide_emails = false        # mask addresses for screenshots / recordings (p)
 - The apps' SQLite databases (OpenCode, Cursor, Antigravity) are read and written through `sqlite3` with
   the SQL on stdin and every value as a hex literal, so no token reaches the process list. A switch
   replaces only the login rows, in one transaction.
-- Use it with accounts you own, within each provider's terms.
+- Use it with accounts you own, within each provider's terms (see [Is this allowed?](#is-this-allowed)).
 
 ## Sessions you already have open
 
