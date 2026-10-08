@@ -13,6 +13,9 @@ Instant account switching for **Claude Code**, **Codex**, **OpenCode**, **Antigr
 accountant      →  ⏎      →  ready to go
 ```
 
+**[mihaicristianfarcas.github.io/accountant](https://mihaicristianfarcas.github.io/accountant/)**: try the
+switcher in your browser.
+
 The cursor already rests on the account with the most headroom, so <kbd>⏎</kbd> switches to it. The switch
 takes well under a second, opens no browser, asks for no 2FA, and accountant quits on its own afterwards.
 
