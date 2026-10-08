@@ -22,6 +22,10 @@ pub const ERR: Color = Color::Rgb(240, 104, 104);
 
 pub const CLAUDE: Color = Color::Rgb(217, 119, 87);
 pub const CODEX: Color = Color::Rgb(94, 196, 170);
+pub const OPENCODE: Color = Color::Rgb(236, 196, 112);
+pub const ANTIGRAVITY: Color = Color::Rgb(112, 154, 246);
+pub const CURSOR: Color = Color::Rgb(198, 202, 216);
+pub const COPILOT: Color = Color::Rgb(186, 136, 246);
 
 /// Stops of the signature gradient (Claude coral → rose → violet → Codex teal).
 const STOPS: [(u8, u8, u8); 4] = [(217, 119, 87), (226, 108, 146), (150, 118, 230), (94, 196, 170)];
@@ -30,6 +34,10 @@ pub fn accent(p: Provider) -> Color {
     match p {
         Provider::Claude => CLAUDE,
         Provider::Codex => CODEX,
+        Provider::OpenCode => OPENCODE,
+        Provider::Antigravity => ANTIGRAVITY,
+        Provider::Cursor => CURSOR,
+        Provider::Copilot => COPILOT,
     }
 }
 

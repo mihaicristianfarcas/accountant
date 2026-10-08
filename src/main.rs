@@ -1,4 +1,5 @@
-//! accountant — instant account switching for Claude Code and Codex.
+//! accountant — instant account switching for Claude Code, Codex, OpenCode,
+//! Antigravity, Cursor and Copilot CLI.
 
 mod browser;
 mod cli;
@@ -13,6 +14,7 @@ mod privacy;
 mod providers;
 mod registry;
 mod secrets;
+mod sqlite;
 mod tui;
 mod twofa;
 mod usage;
@@ -23,8 +25,9 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "accountant",
     version,
-    about = "Instant account switching for Claude Code and Codex",
-    long_about = "Instant account switching for Claude Code and Codex.\n\n\
+    about = "Instant account switching for Claude Code, Codex, OpenCode, Antigravity, Cursor and Copilot",
+    long_about = "Instant account switching for Claude Code, Codex, OpenCode, Antigravity, Cursor and\n\
+        Copilot CLI.\n\n\
         Run without arguments for the interactive switcher. Each account's login is kept in\n\
         your Keychain; switching swaps it in place — no browser, no 2FA. The browser is only\n\
         needed the first time (or when a provider revokes a session), and accountant can fetch\n\
@@ -40,19 +43,20 @@ enum Cmd {
     /// List saved accounts
     #[command(alias = "ls")]
     List,
-    /// Switch to an account: name, email, number or id. A name shared by a Claude Code
-    /// and a Codex account switches both.
+    /// Switch to an account: name, email, number or id. A name shared by accounts of
+    /// different tools (a Claude Code and a Codex "work") switches them all.
     #[command(alias = "switch", alias = "u")]
     Use {
         who: String,
-        /// Only consider this provider (claude | codex)
+        /// Only consider this provider (claude | codex | opencode | antigravity | cursor | copilot)
         #[arg(short, long)]
         provider: Option<String>,
     },
     /// Switch to the account with the most headroom (round-robin when unknown)
     #[command(alias = "n")]
     Next {
-        /// claude | codex (optional when only one has several accounts)
+        /// claude | codex | opencode | antigravity | cursor | copilot (optional when only one
+        /// has several accounts)
         provider: Option<String>,
     },
     /// Save whatever is signed in right now as an account
@@ -62,11 +66,12 @@ enum Cmd {
         #[arg(short, long)]
         provider: Option<String>,
     },
-    /// Add an account (opens the picker: sign in to Claude Code / Codex, or save current)
+    /// Add an account (opens the picker: sign in to any of the tools, or save current)
     Add,
-    /// Sign in with the browser: a new account (`login claude`) or refresh one (`login work`)
+    /// Sign in: a new account (`login claude`) or again to one (`login work`). Claude Code
+    /// and Codex sign in with the browser; OpenCode, Cursor and Copilot with their own command
     Login {
-        /// A provider (claude | codex) or an existing account
+        /// A provider (claude | codex | opencode | antigravity | cursor | copilot) or an account
         target: String,
         /// Account email: prefills the sign-in and isolates its browser session
         #[arg(short, long)]

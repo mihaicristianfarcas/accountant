@@ -100,6 +100,7 @@ pub fn fetch(provider: Provider, tok: &AccessToken) -> Result<Usage> {
             }
             req.call()?
         }
+        other => bail!("{} has no usage meter", other.label()),
     };
     let status = resp.status().as_u16();
     // We only ask with an access token that has not expired, so a 401 means
@@ -114,6 +115,7 @@ pub fn fetch(provider: Provider, tok: &AccessToken) -> Result<Usage> {
     let windows = match provider {
         Provider::Claude => parse_claude(&v),
         Provider::Codex => parse_codex(&v),
+        _ => vec![],
     };
     if windows.is_empty() {
         bail!("usage response had no windows");

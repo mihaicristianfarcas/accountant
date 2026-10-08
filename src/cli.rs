@@ -2,7 +2,7 @@
 
 use crate::config::{IMAP_PASSWORD_KEY, MailSource};
 use crate::engine::{self, Engine};
-use crate::providers::{self, Provider};
+use crate::providers::{self, Provider, SignIn};
 use crate::registry::Profile;
 use crate::{browser, clipboard, mail, privacy, tui, usage};
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,17 +21,16 @@ pub fn paint(code: &str, s: &str) -> String {
 fn provider_arg(p: Option<&str>) -> Result<Option<Provider>> {
     match p {
         None => Ok(None),
-        Some(s) => {
-            Provider::parse(s).map(Some).ok_or_else(|| anyhow!("unknown provider '{s}' (claude | codex)"))
-        }
+        Some(s) => Provider::parse(s).map(Some).ok_or_else(|| {
+            let all = Provider::ALL.iter().map(|p| p.slug()).collect::<Vec<_>>().join(" | ");
+            anyhow!("unknown provider '{s}' ({all})")
+        }),
     }
 }
 
 fn accent(p: Provider, s: &str) -> String {
-    match p {
-        Provider::Claude => paint("38;2;217;119;87", s),
-        Provider::Codex => paint("38;2;94;196;170", s),
-    }
+    let (r, g, b) = tui::theme::rgb(tui::theme::accent(p));
+    paint(&format!("38;2;{r};{g};{b}"), s)
 }
 
 fn resolve_one(e: &Engine, who: &str, provider: Option<Provider>) -> Result<Profile> {
@@ -68,7 +67,13 @@ pub fn list() -> Result<()> {
     let cache = usage::Cache::load(&e.paths.usage_cache());
     let all = e.registry.ordered().into_iter().cloned().collect::<Vec<_>>();
     let active: Vec<Option<String>> = Provider::ALL.iter().map(|p| e.active_id(*p)).collect();
-    for (pi, provider) in Provider::ALL.iter().enumerate() {
+    // The newer CLIs only get a section once they have an account.
+    let shown: Vec<(usize, &Provider)> = Provider::ALL
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.always_listed() || all.iter().any(|x| x.provider == **p))
+        .collect();
+    for (n, &(pi, provider)) in shown.iter().enumerate() {
         println!("{}", accent(*provider, &format!("◆ {}", provider.label().to_uppercase())));
         let mine: Vec<(usize, &Profile)> =
             all.iter().enumerate().filter(|(_, p)| p.provider == *provider).collect();
@@ -102,7 +107,7 @@ pub fn list() -> Result<()> {
                 paint("2", &extra)
             );
         }
-        if pi + 1 < Provider::ALL.len() {
+        if n + 1 < shown.len() {
             println!();
         }
     }
@@ -137,7 +142,7 @@ fn report_switch(e: &Engine, done: &engine::Switched) {
         accent(provider, &p.shown_name()),
         paint("2", &detail)
     );
-    let n = engine::running_sessions(provider);
+    let n = engine::sessions_to_restart(provider);
     if n > 0 {
         println!(
             "  {}",
@@ -189,7 +194,13 @@ pub fn next(provider: Option<&str>) -> Result<()> {
             match multi.as_slice() {
                 [one] => *one,
                 [] => bail!("add a second account first (`accountant login claude`)"),
-                _ => bail!("which one? `accountant next claude` or `accountant next codex`"),
+                many => bail!(
+                    "which one? {}",
+                    many.iter()
+                        .map(|p| format!("`accountant next {}`", p.slug()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             }
         }
     };
@@ -246,18 +257,60 @@ pub fn add() -> Result<()> {
 }
 
 pub fn login(target: &str, email: Option<String>) -> Result<()> {
-    let start = match Provider::parse(target) {
-        Some(provider) => tui::Start::Login { provider, email, adding: true },
+    let (provider, existing) = match Provider::parse(target) {
+        Some(provider) => (provider, None),
         None => {
             let e = Engine::open()?;
             let p = resolve_one(&e, target, None)?;
-            tui::Start::Login { provider: p.provider, email: email.or(p.email), adding: false }
+            (p.provider, Some(p))
         }
     };
     if !std::io::stdout().is_terminal() {
         bail!("sign-in is interactive — run it in a terminal");
     }
-    tui::run(Engine::open()?, start)
+    match provider.sign_in() {
+        SignIn::Browser => {
+            let start = match existing {
+                Some(p) => tui::Start::Login { provider, email: email.or(p.email), adding: false },
+                None => tui::Start::Login { provider, email, adding: true },
+            };
+            tui::run(Engine::open()?, start)
+        }
+        SignIn::Command(argv) => {
+            let mut e = Engine::open()?;
+            // The command replaces the live login: keep it first.
+            let previous = e.sync_back(provider)?.profile_id().map(String::from);
+            println!("{} running `{}`", paint("2", "·"), argv.join(" "));
+            crate::login::run_command(provider)?;
+            let (id, created) = e.finish_external_login(
+                provider,
+                existing.as_ref().map(|p| p.id.as_str()),
+                previous.as_deref(),
+            )?;
+            let p = e.profile(&id)?;
+            println!(
+                "{} {} {} {}  {}",
+                paint("32", "✓"),
+                if created { "added" } else { "signed in again:" },
+                provider.label(),
+                accent(provider, &p.shown_name()),
+                paint("2", &privacy::email(p.email.as_deref().unwrap_or("")))
+            );
+            Ok(())
+        }
+        SignIn::App(app) => {
+            let mut e = Engine::open()?;
+            e.sync_back(provider)?;
+            println!(
+                "{} {} signs in from its app: sign in there, then run `accountant save {}`",
+                paint("2", "·"),
+                app,
+                provider.slug()
+            );
+            println!("{} the current {} login is saved", paint("2", "·"), provider.label());
+            Ok(())
+        }
+    }
 }
 
 pub fn rename(who: &str, name: &str, provider: Option<&str>) -> Result<()> {
@@ -460,7 +513,7 @@ pub fn status() -> Result<()> {
                     .unwrap_or_else(|| "(unsaved)".into());
                 let email = ident.email.as_deref().map(|e| privacy::email(e).into_owned());
                 let detail = [email, ident.plan].into_iter().flatten().collect::<Vec<_>>().join(" · ");
-                let running = engine::running_sessions(p);
+                let running = engine::sessions_to_restart(p);
                 let sessions = if running > 0 { format!("  {running} running") } else { String::new() };
                 println!(
                     "{} {}  {}{}",
@@ -473,6 +526,78 @@ pub fn status() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Doctor sections for OpenCode, Antigravity, Cursor and Copilot. A tool
+/// with no trace on this machine gets one line.
+fn doctor_newer(e: &Engine, ok: &impl Fn(&str), warn: &impl Fn(&str), info: &impl Fn(&str)) {
+    use providers::{antigravity, copilot, cursor};
+    for p in [Provider::OpenCode, Provider::Antigravity, Provider::Cursor, Provider::Copilot] {
+        let bin = match p {
+            Provider::Antigravity => "agy",
+            other => other.process_name(),
+        };
+        let version = version_of(bin);
+        let live = e.live(p);
+        let has_accounts = !e.registry.of(p).is_empty();
+        if version.is_none() && matches!(live, Ok(None)) && !has_accounts {
+            println!("{} {}", accent(p, p.label()), paint("2", "· not installed"));
+            continue;
+        }
+        println!("{}", accent(p, p.label()));
+        match version {
+            Some(v) => ok(&format!("{bin} {v}")),
+            None => info(&format!("`{bin}` not found on PATH")),
+        }
+        let exists = |path: &std::path::Path| path.exists().then(|| path.display().to_string());
+        match p {
+            Provider::OpenCode => {
+                let db = e.paths.opencode_db();
+                if crate::sqlite::has_table(&db, "credential").unwrap_or(false) {
+                    info(&format!("credentials  {} (credential table)", db.display()));
+                } else {
+                    info(&format!("credentials  {}", e.paths.opencode_auth().display()));
+                }
+            }
+            Provider::Antigravity => {
+                info(&format!("credentials  {}", antigravity::KEYCHAIN.describe()));
+                for app in antigravity::APPS {
+                    if let Some(db) = exists(&e.paths.vscode_state_db(app)) {
+                        info(&format!("app          {db}"));
+                    }
+                }
+            }
+            Provider::Cursor => {
+                info(&format!("credentials  {}, {}", cursor::ACCESS.describe(), cursor::REFRESH.service));
+                if let Some(f) = exists(&cursor::agent_file(&e.paths)) {
+                    info(&format!("agent file   {f}"));
+                }
+                if let Some(db) = exists(&e.paths.vscode_state_db(cursor::APP)) {
+                    info(&format!("app          {db} (quit Cursor before switching)"));
+                }
+            }
+            Provider::Copilot => {
+                info(&format!("accounts     {}", e.paths.copilot_config().display()));
+                let users = copilot::signed_in_users(&e.paths);
+                if !users.is_empty() {
+                    info(&format!("signed in    {}", users.join(", ")));
+                }
+            }
+            _ => {}
+        }
+        credential_env_warning(p, warn);
+        match live {
+            Ok(Some((_, id))) => ok(&format!(
+                "signed in as {}",
+                id.email
+                    .map(|e| privacy::email(&e).into_owned())
+                    .or(id.handle)
+                    .unwrap_or_else(|| "an account with no email".into())
+            )),
+            Ok(None) => info("signed out"),
+            Err(err) => warn(&format!("can't read the login: {err:#}")),
+        }
+    }
 }
 
 fn version_of(bin: &str) -> Option<String> {
@@ -552,6 +677,8 @@ pub fn doctor() -> Result<()> {
         Ok(None) => info("signed out"),
         Err(err) => warn(&format!("can't read the login: {err:#}")),
     }
+
+    doctor_newer(&e, &ok, &warn, &info);
 
     println!("{}", paint("1", "sign-in"));
     let apps = browser::installed();

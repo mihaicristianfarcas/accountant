@@ -1,4 +1,4 @@
-//! The two CLIs we manage, and how their live login is read and replaced.
+//! The CLIs we manage, and how their live login is read and replaced.
 //!
 //! A *snapshot* is everything needed to restore a login. Credential blobs are
 //! kept byte-for-byte as the CLI wrote them; only identity fields are parsed.
@@ -7,6 +7,12 @@
 //!   `Claude Code-credentials`, or `~/.claude/.credentials.json`) plus the
 //!   `oauthAccount` object in `~/.claude.json`.
 //! * Codex — `~/.codex/auth.json`.
+//! * OpenCode, Cursor, Copilot CLI, Antigravity — see their modules.
+
+pub mod antigravity;
+pub mod copilot;
+pub mod cursor;
+pub mod opencode;
 
 use crate::fsutil;
 use crate::paths::Paths;
@@ -25,15 +31,47 @@ use std::time::{Duration, Instant, SystemTime};
 pub enum Provider {
     Claude,
     Codex,
+    #[serde(rename = "opencode")]
+    OpenCode,
+    Antigravity,
+    Cursor,
+    Copilot,
+}
+
+/// How a new login for a provider comes about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignIn {
+    /// accountant runs the browser sign-in itself.
+    Browser,
+    /// The CLI's own command, run in this terminal.
+    Command(&'static [&'static str]),
+    /// Only the desktop app signs in.
+    App(&'static str),
 }
 
 impl Provider {
-    pub const ALL: [Provider; 2] = [Provider::Claude, Provider::Codex];
+    pub const ALL: [Provider; 6] = [
+        Provider::Claude,
+        Provider::Codex,
+        Provider::OpenCode,
+        Provider::Antigravity,
+        Provider::Cursor,
+        Provider::Copilot,
+    ];
+
+    /// Shown even without accounts: the switcher's original two.
+    pub fn always_listed(self) -> bool {
+        matches!(self, Provider::Claude | Provider::Codex)
+    }
 
     pub fn label(self) -> &'static str {
         match self {
             Provider::Claude => "Claude Code",
             Provider::Codex => "Codex",
+            Provider::OpenCode => "OpenCode",
+            Provider::Antigravity => "Antigravity",
+            Provider::Cursor => "Cursor",
+            Provider::Copilot => "Copilot",
         }
     }
 
@@ -41,6 +79,10 @@ impl Provider {
         match self {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
+            Provider::OpenCode => "opencode",
+            Provider::Antigravity => "antigravity",
+            Provider::Cursor => "cursor",
+            Provider::Copilot => "copilot",
         }
     }
 
@@ -48,13 +90,40 @@ impl Provider {
         match s.to_ascii_lowercase().as_str() {
             "claude" | "claude-code" | "cc" | "anthropic" => Some(Provider::Claude),
             "codex" | "openai" | "chatgpt" | "cx" => Some(Provider::Codex),
+            "opencode" | "oc" => Some(Provider::OpenCode),
+            "antigravity" | "agy" | "ag" | "google" => Some(Provider::Antigravity),
+            "cursor" | "cursor-agent" | "cu" => Some(Provider::Cursor),
+            "copilot" | "github-copilot" | "gh-copilot" | "co" => Some(Provider::Copilot),
             _ => None,
         }
     }
 
-    /// The executable whose running sessions hold the old login in memory.
+    /// The CLI's executable, as `ps` lists it.
     pub fn process_name(self) -> &'static str {
-        self.slug()
+        match self {
+            Provider::Antigravity => "agy",
+            Provider::Cursor => "cursor-agent",
+            other => other.slug(),
+        }
+    }
+
+    /// Whether a running session keeps the login it started with. Claude Code
+    /// checks its stored login before each request (Keychain reads are cached
+    /// for 30 s), so open sessions follow a switch by themselves. Codex holds
+    /// its login in memory until restarted, and so, as far as we know, do the
+    /// others.
+    pub fn sessions_keep_old_login(self) -> bool {
+        self != Provider::Claude
+    }
+
+    pub fn sign_in(self) -> SignIn {
+        match self {
+            Provider::Claude | Provider::Codex => SignIn::Browser,
+            Provider::OpenCode => SignIn::Command(&["opencode", "auth", "login"]),
+            Provider::Cursor => SignIn::Command(&["cursor-agent", "login"]),
+            Provider::Copilot => SignIn::Command(&["copilot", "login"]),
+            Provider::Antigravity => SignIn::App("Antigravity"),
+        }
     }
 
     /// Environment variables that make the CLI use something other than its
@@ -70,6 +139,9 @@ impl Provider {
                 "CLAUDE_CODE_USE_VERTEX",
             ],
             Provider::Codex => &["OPENAI_API_KEY", "CODEX_API_KEY"],
+            Provider::Cursor => &["CURSOR_API_KEY"],
+            Provider::Copilot => &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+            Provider::OpenCode | Provider::Antigravity => &[],
         }
     }
 
@@ -87,6 +159,10 @@ impl Provider {
         match self {
             Provider::Claude => &["anthropic", "claude"],
             Provider::Codex => &["openai", "chatgpt"],
+            Provider::OpenCode => &["anthropic", "claude", "openai", "chatgpt", "github"],
+            Provider::Antigravity => &["google"],
+            Provider::Cursor => &["cursor"],
+            Provider::Copilot => &["github"],
         }
     }
 }
@@ -99,6 +175,11 @@ pub struct Identity {
     pub email: Option<String>,
     pub org: Option<String>,
     pub plan: Option<String>,
+    /// A username, for naming the account when there is no email.
+    pub handle: Option<String>,
+    /// The key cannot tell two accounts apart (the login names no one and
+    /// its tokens rotate). Matched to the most recently live profile.
+    pub weak: bool,
 }
 
 pub type Snapshot = Value;
@@ -107,6 +188,10 @@ pub fn read_live(provider: Provider, paths: &Paths) -> Result<Option<Snapshot>> 
     match provider {
         Provider::Claude => claude::read_live(paths),
         Provider::Codex => codex::read_live(paths),
+        Provider::OpenCode => opencode::read_live(paths),
+        Provider::Antigravity => antigravity::read_live(paths),
+        Provider::Cursor => cursor::read_live(paths),
+        Provider::Copilot => copilot::read_live(paths),
     }
 }
 
@@ -114,6 +199,10 @@ pub fn write_live(provider: Provider, paths: &Paths, snap: &Snapshot) -> Result<
     match provider {
         Provider::Claude => claude::write_live(paths, snap),
         Provider::Codex => codex::write_live(paths, snap),
+        Provider::OpenCode => opencode::write_live(paths, snap),
+        Provider::Antigravity => antigravity::write_live(paths, snap),
+        Provider::Cursor => cursor::write_live(paths, snap),
+        Provider::Copilot => copilot::write_live(paths, snap),
     }
 }
 
@@ -121,6 +210,10 @@ pub fn identity(provider: Provider, snap: &Snapshot) -> Option<Identity> {
     match provider {
         Provider::Claude => claude::identity(snap),
         Provider::Codex => codex::identity(snap),
+        Provider::OpenCode => opencode::identity(snap),
+        Provider::Antigravity => antigravity::identity(snap),
+        Provider::Cursor => cursor::identity(snap),
+        Provider::Copilot => copilot::identity(snap),
     }
 }
 
@@ -137,15 +230,22 @@ pub fn fingerprint(provider: Provider, snap: &Snapshot) -> Option<String> {
             let v: Value = serde_json::from_str(snap.get("auth")?.as_str()?).ok()?;
             v.get("tokens")?.get("refresh_token")?.as_str()?.to_string()
         }
+        Provider::OpenCode => opencode::secret(snap)?,
+        Provider::Antigravity => antigravity::secret(snap)?,
+        Provider::Cursor => cursor::secret(snap)?,
+        // Copilot snapshots hold no secret: the user they name is the match.
+        Provider::Copilot => return None,
     };
     (!rt.is_empty()).then(|| short_hash(&rt))
 }
 
 /// A short-lived bearer token from the snapshot, if it has not expired.
+/// Only the providers with a usage meter have one to offer.
 pub fn fresh_access_token(provider: Provider, snap: &Snapshot) -> Option<AccessToken> {
     let tok = match provider {
         Provider::Claude => claude::access_token(snap),
         Provider::Codex => codex::access_token(snap),
+        _ => None,
     }?;
     match tok.expires_at {
         Some(exp) if exp <= Utc::now() + chrono::Duration::seconds(30) => None,
@@ -172,6 +272,112 @@ pub fn jwt_claims(token: &str) -> Option<Value> {
 
 fn short_hash(s: &str) -> String {
     hex::encode(&Sha256::digest(s.as_bytes())[..6])
+}
+
+/// A generic-password Keychain item that another CLI owns. With
+/// `paths.keychain_dir` set (tests, sandboxes) it is a file there instead, so
+/// nothing reaches the real Keychain.
+#[derive(Debug, Clone, Copy)]
+pub struct Slot {
+    pub service: &'static str,
+    pub account: &'static str,
+}
+
+impl Slot {
+    pub const fn new(service: &'static str, account: &'static str) -> Self {
+        Slot { service, account }
+    }
+
+    fn file(&self, dir: &Path) -> PathBuf {
+        dir.join(format!("{}__{}", self.service, self.account))
+    }
+
+    pub fn get(&self, paths: &Paths) -> Result<Option<String>> {
+        let v = match &paths.keychain_dir {
+            Some(dir) => fsutil::read_optional(&self.file(dir))?,
+            None if cfg!(target_os = "macos") => KeychainItem::new(self.service, self.account).get()?,
+            None => None,
+        };
+        Ok(v.filter(|s| !s.trim().is_empty()))
+    }
+
+    pub fn set(&self, paths: &Paths, value: &str) -> Result<()> {
+        match &paths.keychain_dir {
+            Some(dir) => fsutil::write_secret(&self.file(dir), value.as_bytes()),
+            None if cfg!(target_os = "macos") => KeychainItem::new(self.service, self.account).set(value),
+            None => bail!(
+                "the {} credential lives in the system keyring, which accountant supports on macOS only",
+                self.service
+            ),
+        }
+    }
+
+    pub fn delete(&self, paths: &Paths) -> Result<()> {
+        match &paths.keychain_dir {
+            Some(dir) => match std::fs::remove_file(self.file(dir)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+                _ => Ok(()),
+            },
+            None if cfg!(target_os = "macos") => KeychainItem::new(self.service, self.account).delete(),
+            None => Ok(()),
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        format!("Keychain item \"{}\" ({})", self.service, self.account)
+    }
+}
+
+/// Email addresses inside `bytes`, also inside base64 runs nested up to two
+/// levels deep (protobuf blobs that apps store as base64 text).
+pub(crate) fn emails_in(bytes: &[u8], depth: u8) -> Vec<String> {
+    let mut out = vec![];
+    let local = |b: u8| b.is_ascii_alphanumeric() || b"._%+-".contains(&b);
+    let domain = |b: u8| b.is_ascii_alphanumeric() || b".-".contains(&b);
+    for (i, _) in bytes.iter().enumerate().filter(|(_, b)| **b == b'@') {
+        let start = (0..i).rev().take_while(|&j| local(bytes[j])).last();
+        let end = (i + 1..bytes.len()).take_while(|&j| domain(bytes[j])).last();
+        if let (Some(s), Some(e)) = (start, end) {
+            let host = &bytes[i + 1..=e];
+            let host = host.strip_suffix(b".").unwrap_or(host);
+            let tld = host.rsplit(|b| *b == b'.').next().unwrap_or_default();
+            if host.contains(&b'.') && tld.len() >= 2 && tld.iter().all(u8::is_ascii_alphabetic) {
+                out.push(format!(
+                    "{}@{}",
+                    String::from_utf8_lossy(&bytes[s..i]),
+                    String::from_utf8_lossy(host)
+                ));
+            }
+        }
+    }
+    if depth > 0 {
+        let b64 = |b: u8| b.is_ascii_alphanumeric() || b"+/=_-".contains(&b);
+        let mut i = 0;
+        while i < bytes.len() {
+            let run = bytes[i..].iter().take_while(|b| b64(**b)).count();
+            if run >= 24 {
+                let chunk = std::str::from_utf8(&bytes[i..i + run]).unwrap_or_default();
+                // A protobuf length byte before the text can itself look like
+                // base64, so the run may start a character or two early. A
+                // misaligned start still decodes, to noise: try them all.
+                use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+                for skip in 0..4 {
+                    let c = &chunk[skip..];
+                    let decoded = STANDARD
+                        .decode(c)
+                        .or_else(|_| STANDARD_NO_PAD.decode(c.trim_end_matches('=')))
+                        .or_else(|_| URL_SAFE_NO_PAD.decode(c.trim_end_matches('=')));
+                    if let Ok(d) = decoded {
+                        out.extend(emails_in(&d, depth - 1));
+                    }
+                }
+            }
+            i += run.max(1);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|e| seen.insert(e.to_lowercase()));
+    out
 }
 
 fn str_at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a str> {
@@ -364,6 +570,7 @@ pub mod claude {
                     email: str_at(a, &["emailAddress"]).map(str::to_string),
                     org: str_at(a, &["organizationName"]).map(str::to_string),
                     plan,
+                    ..Default::default()
                 })
             }
             // Credentials without account metadata (e.g. hand-made). Still
@@ -452,6 +659,7 @@ pub mod codex {
                 email: str_at(&claims, &["email"]).map(str::to_string),
                 org: None,
                 plan: str_at(&oa, &["chatgpt_plan_type"]).map(str::to_string),
+                ..Default::default()
             });
         }
         let key = str_at(&auth, &["OPENAI_API_KEY"])?;
@@ -460,6 +668,7 @@ pub mod codex {
             email: None,
             org: None,
             plan: Some("api key".into()),
+            ..Default::default()
         })
     }
 

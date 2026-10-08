@@ -133,8 +133,14 @@ impl Registry {
         self.profiles.iter_mut().find(|p| p.id == id)
     }
 
+    /// The profile an identity key belongs to. A weak key (see
+    /// [`Identity::weak`]) can match several; the most recently live wins,
+    /// since a login whose tokens rotated is the one that was live.
     pub fn by_identity(&self, provider: Provider, key: &str) -> Option<&Profile> {
-        self.profiles.iter().find(|p| p.provider == provider && p.identity == key)
+        self.profiles
+            .iter()
+            .filter(|p| p.provider == provider && p.identity == key)
+            .max_by_key(|p| [p.used_at, p.saved_at, Some(p.created_at)].into_iter().flatten().max())
     }
 
     /// Resolve a user query: 1-based index, id, name, or email (case-insensitive).
@@ -177,12 +183,14 @@ impl Registry {
         })
     }
 
-    /// A friendly unique name: the email's local part, or "account".
+    /// A friendly unique name: the email's local part, the username, or
+    /// "account".
     pub fn suggest_name(&self, provider: Provider, id: &Identity) -> String {
         let base = id
             .email
             .as_deref()
             .and_then(|e| e.split('@').next())
+            .or(id.handle.as_deref())
             .filter(|s| !s.is_empty())
             .map(sanitize_name)
             .unwrap_or_else(|| "account".into());

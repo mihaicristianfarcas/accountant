@@ -7,7 +7,7 @@ use super::app::{
 use super::theme::{self, *};
 use crate::engine::Stage;
 use crate::privacy;
-use crate::providers::Provider;
+use crate::providers::{Provider, SignIn};
 use crate::registry::Profile;
 use crate::usage::Window;
 use chrono::{DateTime, Utc};
@@ -316,7 +316,10 @@ struct Plan {
 
 fn list_items(profiles: &[Profile], detailed: bool, airy: bool) -> Vec<Item> {
     let mut items = vec![];
-    for (n, p) in Provider::ALL.into_iter().enumerate() {
+    // The newer CLIs only get a section once they have an account.
+    let shown =
+        Provider::ALL.into_iter().filter(|p| p.always_listed() || profiles.iter().any(|x| x.provider == *p));
+    for (n, p) in shown.enumerate() {
         if n > 0 {
             items.push(Item::Gap);
         }
@@ -1281,13 +1284,20 @@ fn draw_login(buf: &mut Buffer, area: Rect, v: &LoginView, opened: f32, secs: f3
 }
 
 fn draw_add(buf: &mut Buffer, area: Rect, cursor: usize, opened: f32) {
-    let inner = card(buf, area, 66, 5, "add account", TEXT, opened);
+    let mut rows: Vec<(&str, String, Color)> = Provider::ALL
+        .iter()
+        .map(|p| {
+            let how = match p.sign_in() {
+                SignIn::Browser => "sign in with the browser".to_string(),
+                SignIn::Command(argv) => format!("runs `{}`", argv.join(" ")),
+                SignIn::App(app) => format!("sign in from the {app} app, then save"),
+            };
+            (p.label(), how, accent(*p))
+        })
+        .collect();
+    rows.push(("Save current", "keep what's signed in right now".into(), DIM));
+    let inner = card(buf, area, 66, rows.len() as u16 + 2, "add account", TEXT, opened);
     clipped(buf, inner, |buf| {
-        let rows = [
-            ("Claude Code", "sign in with the browser", accent(Provider::Claude)),
-            ("Codex", "sign in with the browser", accent(Provider::Codex)),
-            ("Save current", "keep what's signed in right now", DIM),
-        ];
         for (i, (name, desc, c)) in rows.iter().enumerate() {
             let sel = i == cursor;
             let y = inner.y + i as u16;
@@ -1297,7 +1307,7 @@ fn draw_add(buf: &mut Buffer, area: Rect, cursor: usize, opened: f32) {
             let line = Line::from(vec![
                 Span::styled(if sel { " ▸ " } else { "   " }, fg(*c)),
                 Span::styled(pad(name, 16), if sel { bold(*c) } else { fg(TEXT) }),
-                Span::styled(*desc, fg(if sel { DIM } else { FAINT })),
+                Span::styled(desc.clone(), fg(if sel { DIM } else { FAINT })),
             ]);
             put(buf, inner.x, y, &line, inner.width);
         }

@@ -32,6 +32,15 @@ pub fn run(engine: Engine, start: Start) -> Result<()> {
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let result = (|| -> Result<()> {
         loop {
+            // A CLI's own sign-in gets the real terminal while it runs.
+            if let Some(job) = app.external.take() {
+                let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+                ratatui::restore();
+                app.run_external(job);
+                terminal = ratatui::init();
+                let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+                terminal.clear()?;
+            }
             app.tick();
             terminal.draw(|f| view::draw(f, &app))?;
             if app.quit {

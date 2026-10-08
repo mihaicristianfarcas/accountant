@@ -174,6 +174,26 @@ impl Engine {
             .map(|p| p.id.clone())
     }
 
+    /// The profile holding exactly these credentials.
+    fn fingerprint_owner(&self, provider: Provider, snap: &Snapshot) -> Option<String> {
+        let fp = providers::fingerprint(provider, snap)?;
+        self.registry
+            .profiles
+            .iter()
+            .find(|p| p.provider == provider && p.fingerprint.as_ref() == Some(&fp))
+            .map(|p| p.id.clone())
+    }
+
+    /// The profile a login is saved under. A weak identity is matched by its
+    /// exact credentials first, since its key alone can name several.
+    fn existing(&self, provider: Provider, snap: &Snapshot, ident: &Identity) -> Option<String> {
+        ident
+            .weak
+            .then(|| self.fingerprint_owner(provider, snap))
+            .flatten()
+            .or_else(|| self.registry.by_identity(provider, &ident.key).map(|p| p.id.clone()))
+    }
+
     /// Store `snap` under the matching profile, or create one.
     /// Returns (profile id, created).
     fn store(
@@ -183,7 +203,19 @@ impl Engine {
         ident: &Identity,
         name: Option<&str>,
     ) -> Result<(String, bool)> {
-        let existing = self.registry.by_identity(provider, &ident.key).map(|p| p.id.clone());
+        let existing = self.existing(provider, snap, ident);
+        self.store_as(provider, snap, ident, existing, name)
+    }
+
+    /// Store `snap` under `existing`, or a new profile when `None`.
+    fn store_as(
+        &mut self,
+        provider: Provider,
+        snap: &Snapshot,
+        ident: &Identity,
+        existing: Option<String>,
+        name: Option<&str>,
+    ) -> Result<(String, bool)> {
         let (id, created) = match existing {
             Some(id) => (id, false),
             None => {
@@ -260,7 +292,20 @@ impl Engine {
         let Some((snap, ident)) = self.live(provider)? else {
             return Ok(None);
         };
-        let (id, created) = self.store(provider, &snap, &ident, name)?;
+        let existing = match self.existing(provider, &snap, &ident) {
+            // A weak key cannot tell accounts apart: a new name means a new one.
+            Some(id)
+                if ident.weak
+                    && self.fingerprint_owner(provider, &snap).is_none()
+                    && name.is_some_and(|n| {
+                        self.registry.get(&id).is_some_and(|p| !p.name.eq_ignore_ascii_case(n))
+                    }) =>
+            {
+                None
+            }
+            other => other,
+        };
+        let (id, created) = self.store_as(provider, &snap, &ident, existing, name)?;
         if let Some(n) = name
             && !created
             && !self.registry.name_taken(provider, n, Some(&id))
@@ -386,6 +431,40 @@ impl Engine {
         Ok((id, created))
     }
 
+    /// After a CLI's own sign-in command (OpenCode, Cursor, Copilot): save
+    /// the login it left live. `target` is the account being signed in again,
+    /// `previous` the one that was live before. Returns (profile id, created).
+    pub fn finish_external_login(
+        &mut self,
+        provider: Provider,
+        target: Option<&str>,
+        previous: Option<&str>,
+    ) -> Result<(String, bool)> {
+        let _lock = self.lock()?;
+        let (snap, ident) = self
+            .live(provider)?
+            .ok_or_else(|| anyhow!("no {} login was found after signing in", provider.label()))?;
+        let existing = match target {
+            // Signing in again, unless the login plainly names someone else.
+            Some(t) if ident.weak || self.profile(t)?.identity == ident.key => Some(t.to_string()),
+            // A weak key cannot tell this sign-in from an earlier account.
+            None if ident.weak => self.fingerprint_owner(provider, &snap),
+            _ => self.existing(provider, &snap, &ident),
+        };
+        let (id, created) = self.store_as(provider, &snap, &ident, existing, None)?;
+        let now = Utc::now();
+        if let Some(prev) = previous.filter(|p| *p != id)
+            && let Some(p) = self.registry.get_mut(prev)
+        {
+            p.left_at = Some(now);
+        }
+        let p = self.registry.get_mut(&id).unwrap();
+        p.used_at = Some(now);
+        p.needs_login = false;
+        self.persist()?;
+        Ok((id, created))
+    }
+
     pub fn rename(&mut self, id: &str, name: &str) -> Result<()> {
         let _lock = self.lock()?;
         let name = crate::registry::sanitize_name(name);
@@ -452,10 +531,13 @@ impl Engine {
     }
 }
 
-/// How many interactive sessions of the provider's CLI are running (they keep
-/// the old login in memory until restarted). Background helpers without a
+/// How many interactive sessions of the provider's CLI still hold the old
+/// login and need a restart to pick up a switch. Background helpers without a
 /// terminal are not counted.
-pub fn running_sessions(provider: Provider) -> usize {
+pub fn sessions_to_restart(provider: Provider) -> usize {
+    if !provider.sessions_keep_old_login() {
+        return 0;
+    }
     let Ok(out) = Command::new("ps").args(["-axo", "tty=,comm="]).stderr(Stdio::null()).output() else {
         return 0;
     };
@@ -481,13 +563,7 @@ mod tests {
         unsafe { std::env::set_var("ACCOUNTANT_CLAUDE_CREDENTIALS", "file") };
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let paths = Paths {
-            data: root.join("data"),
-            claude_dir: root.join(".claude"),
-            claude_json: root.join(".claude.json"),
-            claude_store: None,
-            codex_home: root.join(".codex"),
-        };
+        let paths = Paths::sandbox(root);
         std::fs::create_dir_all(&paths.claude_dir).unwrap();
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         let mut engine = Engine::open_at(paths).unwrap();
@@ -640,5 +716,268 @@ mod tests {
         e.remove(&a).unwrap();
         assert!(e.vault.get(&format!("totp:{a}")).unwrap().is_none());
         assert!(e.vault.get(&format!("profile:{a}")).unwrap().is_none());
+    }
+
+    // -- the newer CLIs -----------------------------------------------------
+
+    use crate::providers::tests::fake_jwt;
+    use crate::sqlite::tests::{exec, opencode_db, put, state_db};
+
+    fn openai_cred(email: &str, user: &str, refresh: &str) -> String {
+        let access = fake_jwt(json!({
+            "https://api.openai.com/profile": { "email": email },
+            "https://api.openai.com/auth": { "chatgpt_user_id": user },
+        }));
+        json!({ "type": "oauth", "methodID": "chatgpt-browser", "refresh": refresh, "access": access,
+                "expires": 1, "metadata": { "accountID": format!("acct-{user}") } })
+        .to_string()
+    }
+
+    fn anthropic_cred(refresh: &str) -> String {
+        json!({ "type": "oauth", "refresh": refresh, "access": format!("sk-ant-oat-{refresh}"), "expires": 1 })
+            .to_string()
+    }
+
+    #[test]
+    fn opencode_switches_credential_rows() {
+        let (_d, mut e) = sandbox();
+        let db = e.paths.opencode_db();
+        std::fs::create_dir_all(&e.paths.opencode_dir).unwrap();
+        opencode_db(&db, &[("c1", "openai", &openai_cred("a@x.com", "ua", "rt-a"))]);
+        let (a, _) = e.save_current(Provider::OpenCode, None).unwrap().unwrap();
+        assert_eq!(e.profile(&a).unwrap().email.as_deref(), Some("a@x.com"));
+        assert_eq!(e.profile(&a).unwrap().plan.as_deref(), Some("openai"));
+
+        opencode_db(&db, &[("c2", "openai", &openai_cred("b@x.com", "ub", "rt-b"))]);
+        let (b, _) = e.save_current(Provider::OpenCode, None).unwrap().unwrap();
+        assert_ne!(a, b);
+        // Some unrelated table OpenCode keeps next to the credentials.
+        exec(&db, "CREATE TABLE session (id text); INSERT INTO session VALUES ('keep me');");
+
+        e.switch(&a).unwrap();
+        assert_eq!(e.active_id(Provider::OpenCode).as_deref(), Some(a.as_str()));
+        let rows = crate::sqlite::rows(&db, "credential", "1").unwrap();
+        assert_eq!(rows.len(), 1);
+        let value = crate::sqlite::kv::entry(&{
+            let mut r = rows[0].clone();
+            r.insert("key".into(), r["id"].clone());
+            r
+        })
+        .unwrap()
+        .1;
+        assert!(value.contains("rt-a"));
+        assert_eq!(crate::sqlite::rows(&db, "session", "1").unwrap().len(), 1);
+        e.switch(&b).unwrap();
+        assert_eq!(e.active_id(Provider::OpenCode).as_deref(), Some(b.as_str()));
+    }
+
+    #[test]
+    fn opencode_tells_apart_anthropic_logins_it_cannot_name() {
+        let (_d, mut e) = sandbox();
+        let db = e.paths.opencode_db();
+        std::fs::create_dir_all(&e.paths.opencode_dir).unwrap();
+        // Two sign-ins through accountant, each to an account the token can't name.
+        opencode_db(&db, &[("c1", "anthropic", &anthropic_cred("rt-a"))]);
+        let (a, created) = e.finish_external_login(Provider::OpenCode, None, None).unwrap();
+        assert!(created);
+        opencode_db(&db, &[("c2", "anthropic", &anthropic_cred("rt-b"))]);
+        let (b, created) = e.finish_external_login(Provider::OpenCode, None, Some(&a)).unwrap();
+        assert!(created);
+        assert_ne!(a, b);
+
+        // b is live and OpenCode rotates its refresh token: still b, not a new account.
+        opencode_db(&db, &[("c2", "anthropic", &anthropic_cred("rt-b2"))]);
+        assert!(matches!(e.sync_back(Provider::OpenCode).unwrap(), Synced::Saved(ref id) if *id == b));
+        assert_eq!(e.registry.of(Provider::OpenCode).len(), 2);
+
+        e.switch(&a).unwrap();
+        assert!(
+            crate::sqlite::rows(&db, "credential", "1").unwrap()[0]["value"]["h"]
+                .as_str()
+                .unwrap()
+                .contains(&hex::encode_upper("rt-a"))
+        );
+        // Back to b: the rotated token, saved before the swap, comes back.
+        e.switch(&b).unwrap();
+        assert!(e.snapshot(&b).unwrap().unwrap().to_string().contains(&hex::encode_upper("rt-b2")));
+        assert_eq!(e.active_id(Provider::OpenCode).as_deref(), Some(b.as_str()));
+    }
+
+    #[test]
+    fn opencode_one_still_uses_auth_json() {
+        let (_d, mut e) = sandbox();
+        std::fs::create_dir_all(&e.paths.opencode_dir).unwrap();
+        let auth = |rt: &str| {
+            json!({ "anthropic": serde_json::from_str::<serde_json::Value>(&anthropic_cred(rt)).unwrap() })
+                .to_string()
+        };
+        std::fs::write(e.paths.opencode_auth(), auth("rt-a")).unwrap();
+        let (a, _) = e.save_current(Provider::OpenCode, Some("a")).unwrap().unwrap();
+        std::fs::write(e.paths.opencode_auth(), auth("rt-b")).unwrap();
+        let (b, created) = e.save_current(Provider::OpenCode, Some("b")).unwrap().unwrap();
+        assert!(created, "a new name for a login the key can't name is a new account");
+        e.switch(&a).unwrap();
+        assert!(std::fs::read_to_string(e.paths.opencode_auth()).unwrap().contains("rt-a"));
+        assert_ne!(a, b);
+    }
+
+    fn cursor_token(sub: &str) -> String {
+        fake_jwt(json!({ "sub": sub, "iss": "https://authentication.cursor.sh", "type": "session" }))
+    }
+
+    #[test]
+    fn cursor_switches_keychain_agent_file_and_app_rows() {
+        let (_d, mut e) = sandbox();
+        let paths = e.paths.clone();
+        let app_dir = paths.vscode_state_db(crate::providers::cursor::APP);
+        std::fs::create_dir_all(app_dir.parent().unwrap()).unwrap();
+        let db = state_db(app_dir.parent().unwrap());
+        put(&db, "workbench.colorTheme", "dark");
+        let sign_in = |sub: &str, email: &str, plan: &str| {
+            let (acc, refr) = (crate::providers::cursor::ACCESS, crate::providers::cursor::REFRESH);
+            acc.set(&paths, &cursor_token(sub)).unwrap();
+            refr.set(&paths, &format!("refresh-{sub}")).unwrap();
+            put(&db, "cursorAuth/cachedEmail", email);
+            put(&db, "cursorAuth/stripeMembershipType", plan);
+        };
+        sign_in("auth0|user_a", "a@x.com", "pro");
+        let (a, _) = e.save_current(Provider::Cursor, None).unwrap().unwrap();
+        let pa = e.profile(&a).unwrap();
+        assert_eq!((pa.email.as_deref(), pa.plan.as_deref()), (Some("a@x.com"), Some("pro")));
+        assert_eq!(pa.identity, "cursor:auth0|user_a");
+
+        sign_in("auth0|user_b", "b@x.com", "free");
+        let (b, _) = e.save_current(Provider::Cursor, None).unwrap().unwrap();
+        std::fs::create_dir_all(&paths.cursor_agent_dir).unwrap();
+
+        e.switch(&a).unwrap();
+        assert_eq!(e.active_id(Provider::Cursor).as_deref(), Some(a.as_str()));
+        assert_eq!(
+            crate::providers::cursor::REFRESH.get(&paths).unwrap().as_deref(),
+            Some("refresh-auth0|user_a")
+        );
+        let rows = crate::sqlite::kv::get_prefix(&db, "cursorAuth/").unwrap();
+        let email =
+            rows.iter().filter_map(crate::sqlite::kv::entry).find(|(k, _)| k == "cursorAuth/cachedEmail");
+        assert_eq!(email.map(|(_, v)| v).as_deref(), Some("a@x.com"));
+        // The app's other settings are untouched.
+        assert_eq!(crate::sqlite::kv::get(&db, &["workbench.colorTheme"]).unwrap().len(), 1);
+        e.switch(&b).unwrap();
+        assert_eq!(e.active_id(Provider::Cursor).as_deref(), Some(b.as_str()));
+    }
+
+    #[test]
+    fn copilot_switches_the_active_github_user_and_nothing_else() {
+        let (_d, mut e) = sandbox();
+        let cfg = e.paths.copilot_config();
+        std::fs::create_dir_all(&e.paths.copilot_home).unwrap();
+        let user = |login: &str| json!({ "host": "https://github.com", "login": login });
+        let write = |last: &str| {
+            let doc = json!({
+                "banner": "never",
+                "loggedInUsers": [user("octo-work"), user("octo-home")],
+                "lastLoggedInUser": user(last),
+                "trusted_folders": ["/src"],
+            });
+            std::fs::write(&cfg, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        };
+        write("octo-work");
+        let (work, _) = e.save_current(Provider::Copilot, None).unwrap().unwrap();
+        assert_eq!(e.profile(&work).unwrap().name, "octo-work");
+        write("octo-home");
+        let (home, _) = e.save_current(Provider::Copilot, None).unwrap().unwrap();
+
+        e.switch(&work).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(doc["lastLoggedInUser"]["login"], "octo-work");
+        assert_eq!(doc["loggedInUsers"].as_array().unwrap().len(), 2);
+        assert_eq!(doc["banner"], "never");
+        assert_eq!(doc["trusted_folders"][0], "/src");
+        assert_eq!(e.active_id(Provider::Copilot).as_deref(), Some(work.as_str()));
+        e.switch(&home).unwrap();
+        assert_eq!(e.active_id(Provider::Copilot).as_deref(), Some(home.as_str()));
+        // No secret was ever stored for Copilot.
+        assert!(!e.snapshot(&home).unwrap().unwrap().to_string().contains("gho_"));
+    }
+
+    #[test]
+    fn copilot_keeps_the_older_field_names() {
+        let (_d, mut e) = sandbox();
+        std::fs::create_dir_all(&e.paths.copilot_home).unwrap();
+        let cfg = e.paths.copilot_config();
+        std::fs::write(
+            &cfg,
+            r#"{"last_logged_in_user":{"host":"https://github.com","login":"a"},"logged_in_users":[{"host":"https://github.com","login":"a"},{"host":"https://github.com","login":"b"}]}"#,
+        )
+        .unwrap();
+        let (a, _) = e.save_current(Provider::Copilot, None).unwrap().unwrap();
+        std::fs::write(
+            &cfg,
+            std::fs::read_to_string(&cfg).unwrap().replacen(r#""login":"a"}"#, r#""login":"b"}"#, 1),
+        )
+        .unwrap();
+        e.save_current(Provider::Copilot, None).unwrap();
+        e.switch(&a).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(doc["last_logged_in_user"]["login"], "a");
+        assert!(doc.get("lastLoggedInUser").is_none());
+    }
+
+    /// The IDE's value: base64 of a protobuf that holds base64 of another.
+    fn antigravity_blob(email: &str) -> String {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let inner = [b"\x12\x10".as_slice(), email.as_bytes(), b"\x1a\x04name"].concat();
+        let middle = [b"\x0a\x30".as_slice(), b64.encode(&inner).as_bytes()].concat();
+        b64.encode(middle)
+    }
+
+    #[test]
+    fn antigravity_switches_keychain_and_ide_rows() {
+        use base64::Engine as _;
+        let (_d, mut e) = sandbox();
+        let paths = e.paths.clone();
+        let app_db = paths.vscode_state_db("Antigravity");
+        std::fs::create_dir_all(app_db.parent().unwrap()).unwrap();
+        let db = state_db(app_db.parent().unwrap());
+        let sign_in = |email: &str, rt: &str| {
+            let item = json!({ "token": { "access_token": "ya29", "token_type": "Bearer", "refresh_token": rt,
+                               "expiry": "2026-01-01T00:00:00Z" }, "auth_method": "consumer" });
+            let value = format!(
+                "go-keyring-base64:{}",
+                base64::engine::general_purpose::STANDARD.encode(item.to_string())
+            );
+            crate::providers::antigravity::KEYCHAIN.set(&paths, &value).unwrap();
+            put(&db, "antigravityUnifiedStateSync.oauthToken", &antigravity_blob(email));
+            put(&db, "antigravityUnifiedStateSync.userStatus", &antigravity_blob(email));
+            put(&db, "jetskiStateSync.agentManagerInitState", "user-of-the-moment");
+        };
+        sign_in("a@gmail.com", "1//rt-a");
+        let (a, _) = e.save_current(Provider::Antigravity, None).unwrap().unwrap();
+        let pa = e.profile(&a).unwrap();
+        assert_eq!(pa.email.as_deref(), Some("a@gmail.com"));
+        assert_eq!(pa.plan.as_deref(), Some("consumer"));
+        sign_in("b@gmail.com", "1//rt-b");
+        let (b, _) = e.save_current(Provider::Antigravity, None).unwrap().unwrap();
+        assert_ne!(a, b);
+
+        e.switch(&a).unwrap();
+        assert_eq!(e.active_id(Provider::Antigravity).as_deref(), Some(a.as_str()));
+        assert!(crate::sqlite::kv::get(&db, &["jetskiStateSync.agentManagerInitState"]).unwrap().is_empty());
+        let item = crate::providers::antigravity::KEYCHAIN.get(&paths).unwrap().unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(item.trim_start_matches("go-keyring-base64:"))
+            .unwrap();
+        assert!(String::from_utf8(decoded).unwrap().contains("1//rt-a"));
+        e.switch(&b).unwrap();
+        assert_eq!(e.active_id(Provider::Antigravity).as_deref(), Some(b.as_str()));
+    }
+
+    #[test]
+    fn missing_tools_read_as_signed_out() {
+        let (_d, e) = sandbox();
+        for p in [Provider::OpenCode, Provider::Antigravity, Provider::Cursor, Provider::Copilot] {
+            assert!(e.live(p).unwrap().is_none(), "{}", p.label());
+        }
     }
 }

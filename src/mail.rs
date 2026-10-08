@@ -42,6 +42,10 @@ pub fn provider_domains(p: Provider) -> &'static [&'static str] {
     match p {
         Provider::Claude => &["claude.ai", "claude.com", "anthropic.com"],
         Provider::Codex => &["openai.com", "chatgpt.com"],
+        Provider::OpenCode => &["claude.ai", "anthropic.com", "openai.com", "chatgpt.com", "github.com"],
+        Provider::Antigravity => &["google.com"],
+        Provider::Cursor => &["cursor.com", "cursor.sh"],
+        Provider::Copilot => &["github.com"],
     }
 }
 

@@ -8,10 +8,12 @@
 //! * Codex ignores `$BROWSER`, so we run its (open-source) OAuth PKCE flow
 //!   ourselves, on the same localhost callback it registers, and write an
 //!   `auth.json` identical to what `codex login` produces.
+//! * OpenCode, Cursor and Copilot CLI sign in with their own command, run in
+//!   this terminal ([`run_command`]); Antigravity only from its app.
 
 use crate::browser;
 use crate::config::BrowserConfig;
-use crate::providers::{Provider, Snapshot, codex};
+use crate::providers::{Provider, SignIn, Snapshot, codex};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -75,6 +77,7 @@ impl LoginTask {
                 let c = cancel.clone();
                 std::thread::spawn(move || run_codex(listener, email, plan, tx, c));
             }
+            other => bail!("{} signs in with its own command, not in the browser", other.label()),
         }
         Ok(LoginTask { provider, rx, cancel, stdin })
     }
@@ -101,6 +104,31 @@ impl Drop for LoginTask {
     fn drop(&mut self) {
         self.cancel();
     }
+}
+
+// ---------------------------------------------------------------------------
+// CLIs that sign in with their own command
+// ---------------------------------------------------------------------------
+
+/// Run a CLI's own sign-in (`cursor-agent login`, …) in this terminal.
+pub fn run_command(provider: Provider) -> Result<()> {
+    let SignIn::Command(argv) = provider.sign_in() else {
+        bail!("{} has no sign-in command", provider.label());
+    };
+    let mut cmd = Command::new(argv[0]);
+    cmd.args(&argv[1..]);
+    // A token in the environment would stand in for the login being made.
+    for key in provider.credential_env() {
+        cmd.env_remove(key);
+    }
+    let status = cmd.status().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => anyhow!("`{}` is not installed (or not on PATH)", argv[0]),
+        _ => anyhow!("running `{}`: {e}", argv.join(" ")),
+    })?;
+    if !status.success() {
+        bail!("`{}` did not finish signing in", argv.join(" "));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

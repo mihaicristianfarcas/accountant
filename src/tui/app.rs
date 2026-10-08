@@ -6,7 +6,7 @@ use crate::config::{BrowserMode, IMAP_PASSWORD_KEY, MailSource};
 use crate::engine::{self, Engine, Stage};
 use crate::login::{BrowserPlan, LoginEvent, LoginTask};
 use crate::mail::{self, MailEvent};
-use crate::providers::{self, Provider};
+use crate::providers::{self, Provider, SignIn};
 use crate::registry::Profile;
 use crate::twofa::TotpSecret;
 use crate::usage::{self, Usage};
@@ -25,7 +25,7 @@ pub struct App {
     pub engine: Engine,
     pub t0: Instant,
     pub cursor: usize,
-    pub active: [Option<String>; 2],
+    pub active: [Option<String>; Provider::ALL.len()],
     pub usage: usage::Cache,
     usage_rx: Option<Receiver<(String, Result<Usage>)>>,
     pub modal: Option<Modal>,
@@ -36,13 +36,19 @@ pub struct App {
     /// Printed to the normal screen after the TUI closes.
     pub farewell: Vec<String>,
     pub browsers: Vec<BrowserApp>,
+    /// A CLI's own sign-in to run with the terminal handed over.
+    pub external: Option<External>,
+}
+
+/// A sign-in that runs a CLI's own command (`cursor-agent login`, …).
+pub struct External {
+    pub provider: Provider,
+    /// The account being signed in again, if any.
+    pub target: Option<String>,
 }
 
 pub fn pidx(p: Provider) -> usize {
-    match p {
-        Provider::Claude => 0,
-        Provider::Codex => 1,
-    }
+    Provider::ALL.iter().position(|x| *x == p).expect("every provider is in ALL")
 }
 
 pub enum Modal {
@@ -184,7 +190,7 @@ impl App {
             engine,
             t0: Instant::now(),
             cursor: 0,
-            active: [None, None],
+            active: Default::default(),
             usage: usage::Cache::default(),
             usage_rx: None,
             modal: None,
@@ -193,6 +199,7 @@ impl App {
             quit: false,
             farewell: vec![],
             browsers: browser::installed(),
+            external: None,
         };
         app.usage = usage::Cache::load(&app.engine.paths.usage_cache());
 
@@ -407,7 +414,7 @@ impl App {
             if v.stage >= Stage::ALL.len() {
                 let done = v.sw.take().map(engine::Switch::finish);
                 self.refresh_active();
-                v.running = engine::running_sessions(v.provider);
+                v.running = engine::sessions_to_restart(v.provider);
                 v.phase = Phase::Success { at: now };
                 if let Some(p) = self.engine.registry.get(&v.to.id) {
                     v.to = p.clone();
@@ -453,7 +460,7 @@ impl App {
                                 if let Some(i) = self.profiles().iter().position(|x| x.id == p.id) {
                                     self.cursor = i;
                                 }
-                                let running = engine::running_sessions(v.provider);
+                                let running = engine::sessions_to_restart(v.provider);
                                 self.farewell = farewell_lines(p, false, running);
                             }
                             v.result = profile;
@@ -574,7 +581,7 @@ impl App {
             KeyCode::Char('a') | KeyCode::Char('+') => Some(Modal::Add { cursor: 0 }),
             KeyCode::Char('r') => {
                 let p = self.selected()?;
-                self.start_login(p.provider, p.email.clone(), false)
+                self.sign_in(p.provider, Some(p), false)
             }
             KeyCode::Char('n') | KeyCode::Char('e') => {
                 let p = self.selected()?;
@@ -680,6 +687,53 @@ impl App {
                 self.toast(ToastKind::Bad, format!("{e:#}"));
                 None
             }
+        }
+    }
+
+    /// Sign in to `provider` (again, to `target`) the way that CLI signs in.
+    fn sign_in(&mut self, provider: Provider, target: Option<Profile>, adding: bool) -> Option<Modal> {
+        match provider.sign_in() {
+            SignIn::Browser => self.start_login(provider, target.and_then(|p| p.email), adding),
+            SignIn::Command(_) => {
+                self.external = Some(External { provider, target: target.map(|p| p.id) });
+                None
+            }
+            SignIn::App(app) => {
+                // Whatever is signed in now is kept before the app replaces it.
+                if let Err(e) = self.engine.sync_back(provider) {
+                    self.toast(ToastKind::Bad, format!("{e:#}"));
+                } else {
+                    self.toast(ToastKind::Info, format!("sign in from the {app} app, then a → save current"));
+                }
+                None
+            }
+        }
+    }
+
+    /// Run a CLI's own sign-in while the TUI is suspended, then save what it
+    /// signed in to.
+    pub fn run_external(&mut self, job: External) {
+        let label = job.provider.label();
+        let result = (|| -> Result<(String, bool)> {
+            let previous = self.engine.sync_back(job.provider)?.profile_id().map(String::from);
+            if let SignIn::Command(argv) = job.provider.sign_in() {
+                println!("\n  {label} · running `{}` (the current login is saved)\n", argv.join(" "));
+            }
+            crate::login::run_command(job.provider)?;
+            self.engine.finish_external_login(job.provider, job.target.as_deref(), previous.as_deref())
+        })();
+        match result {
+            Ok((id, created)) => {
+                self.refresh_active();
+                if let Some(i) = self.profiles().iter().position(|p| p.id == id) {
+                    self.cursor = i;
+                }
+                let name =
+                    self.engine.registry.get(&id).map(|p| p.shown_name().into_owned()).unwrap_or_default();
+                let verb = if created { "added" } else { "signed in again" };
+                self.toast(ToastKind::Good, format!("{verb}: {name} ({label})"));
+            }
+            Err(e) => self.toast(ToastKind::Bad, format!("{label}: {e:#}")),
         }
     }
 
@@ -798,7 +852,7 @@ impl App {
                 }
             },
             Phase::Failed(_) => match key.code {
-                KeyCode::Char('r') => self.start_login(v.to.provider, v.to.email.clone(), false),
+                KeyCode::Char('r') => self.sign_in(v.to.provider, Some(v.to.clone()), false),
                 _ => None,
             },
         }
@@ -901,27 +955,31 @@ impl App {
     }
 
     fn add_key(&mut self, cursor: usize, key: KeyEvent) -> Option<Modal> {
-        const N: usize = 3;
+        // One row per provider, then "save current".
+        const N: usize = Provider::ALL.len() + 1;
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => Some(Modal::Add { cursor: (cursor + N - 1) % N }),
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
                 Some(Modal::Add { cursor: (cursor + 1) % N })
             }
             KeyCode::Esc | KeyCode::Char('q') => None,
-            KeyCode::Char('1') | KeyCode::Char('c') => self.add_key(0, KeyEvent::from(KeyCode::Enter)),
-            KeyCode::Char('2') | KeyCode::Char('x') => self.add_key(1, KeyEvent::from(KeyCode::Enter)),
-            KeyCode::Enter | KeyCode::Char(' ') => match cursor {
-                0 | 1 => {
-                    let provider = Provider::ALL[cursor];
-                    Some(Modal::Input(InputView {
-                        title: format!("sign in · {}", provider.label()),
-                        hint: "account email — prefills the sign-in and gives it its own browser session (optional)".into(),
-                        value: String::new(),
-                        error: None,
-                        purpose: InputPurpose::LoginEmail(provider),
-                    }))
-                }
-                _ => {
+            KeyCode::Char('c') => self.add_key(0, KeyEvent::from(KeyCode::Enter)),
+            KeyCode::Char('x') => self.add_key(1, KeyEvent::from(KeyCode::Enter)),
+            KeyCode::Char(c @ '1'..='9') if ((c as u8 - b'1') as usize) < N => {
+                self.add_key((c as u8 - b'1') as usize, KeyEvent::from(KeyCode::Enter))
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => match Provider::ALL.get(cursor).copied() {
+                Some(provider) if provider.sign_in() == SignIn::Browser => Some(Modal::Input(InputView {
+                    title: format!("sign in · {}", provider.label()),
+                    hint:
+                        "account email — prefills the sign-in and gives it its own browser session (optional)"
+                            .into(),
+                    value: String::new(),
+                    error: None,
+                    purpose: InputPurpose::LoginEmail(provider),
+                })),
+                Some(provider) => self.sign_in(provider, None, true),
+                None => {
                     let mut saved = vec![];
                     for p in Provider::ALL {
                         match self.engine.save_current(p, None) {
@@ -1217,13 +1275,7 @@ mod tests {
         unsafe { std::env::set_var("ACCOUNTANT_CLAUDE_CREDENTIALS", "file") };
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let paths = Paths {
-            data: root.join("data"),
-            claude_dir: root.join(".claude"),
-            claude_json: root.join(".claude.json"),
-            claude_store: None,
-            codex_home: root.join(".codex"),
-        };
+        let paths = Paths::sandbox(root);
         let mut engine = Engine::open_at(paths).unwrap();
         engine.vault = Vault::Files(root.join("data/secrets"));
         engine.config.ui.usage = false;
