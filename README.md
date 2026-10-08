@@ -52,9 +52,28 @@ login is never thrown away: accounts you signed into outside accountant are adop
 
 ## Install
 
+**Apple Silicon Mac** (macOS 11 or newer): the prebuilt binary from the
+[latest release](https://github.com/mihaicristianfarcas/accountant/releases/latest).
+
 ```sh
-cargo install --path .
-accountant            # first run saves whatever you're signed in to right now
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/mihaicristianfarcas/accountant/releases/latest/download/accountant-aarch64-apple-darwin.tar.gz | tar xz -C ~/.local/bin
+```
+
+`~/.local/bin` is where Claude Code installs itself too. If your shell can't find `accountant`, add the folder
+to your PATH: `echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc`.
+
+**Any Mac, from source** (needs [Rust](https://rustup.rs)):
+
+```sh
+cargo install --git https://github.com/mihaicristianfarcas/accountant --locked
+```
+
+Then run it once:
+
+```sh
+accountant            # the first run saves whatever you're signed in to right now
+accountant doctor     # what accountant found for each tool
 ```
 
 ## Signing in, and 2FA
@@ -254,7 +273,8 @@ Checked against Claude Code 2.1.292 and Codex 0.160.0. Older Claude Code release
 ## Development
 
 ```sh
-cargo test          # unit + flow tests; nothing touches real credentials
+cargo test             # unit + flow tests; nothing touches real credentials
+cargo install --path . # install your checkout
 ```
 
 Every location can be redirected, which is how the tests and a manual sandbox run work:
