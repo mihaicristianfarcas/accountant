@@ -14,7 +14,7 @@ without signing out. When you hit a usage limit:
 accountant      →  ⏎      →  ready to go
 ```
 
-**[mihaicristianfarcas.github.io/accountant](https://mihaicristianfarcas.github.io/accountant/)**: try the
+**[accountant.mihaicristian.dev](https://accountant.mihaicristian.dev)**: try the
 switcher in your browser.
 
 The cursor already rests on the account with the most headroom, so <kbd>⏎</kbd> switches to it. The switch
@@ -338,6 +338,7 @@ Checked against Claude Code 2.1.292 and Codex 0.160.0. Older Claude Code release
 ```sh
 cargo test             # unit + flow tests; nothing touches real credentials
 cargo install --path . # install your checkout
+wrangler deploy        # publish site/ to accountant.mihaicristian.dev (Cloudflare)
 ```
 
 Every location can be redirected, which is how the tests and a manual sandbox run work:
