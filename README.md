@@ -83,8 +83,9 @@ Some points are specific to one tool:
 - **Claude logins in accountant.** Anthropic's Claude Code docs say developers "may not collect, store, or
   intermediate Claude.ai credentials or session tokens". accountant keeps its copies only in your own
   Keychain, signs in only through Claude Code's own flow, and sends a token nowhere but Anthropic, but it
-  does store them. The usage meters are the one place accountant itself uses a Claude login: a read-only
-  request for that account's usage. Turn them off if you'd rather it didn't.
+  does store them. The usage meters are the one place accountant itself uses a Claude login: read-only
+  requests for that account's usage and, for a login it hasn't seen, whose it is. Turn them off if you'd
+  rather it didn't.
 - **Claude logins in OpenCode.** The same docs say Pro and Max logins are meant for "Claude Code and other
   native Anthropic applications", which leaves out third-party tools such as OpenCode. accountant can switch
   such a login, but it can't make that use allowed. Google logins in third-party tools carry the same risk:
@@ -211,6 +212,9 @@ Meters are best effort, and for now only Claude Code and Codex have them. They a
   (`api.anthropic.com/api/oauth/usage`, `chatgpt.com/backend-api/wham/usage`). Each request carries that
   account's access token and `User-Agent: accountant/<version>`. accountant only asks for accounts whose
   short-lived access token is still valid, and never refreshes a token to do so.
+- **Also:** before saving a Claude login whose tokens no account holds yet (a sign-in, or tokens Claude
+  Code rotated), one request with them to `api.anthropic.com/api/oauth/profile`, the endpoint Claude Code
+  asks after a sign-in, to learn whose they are (see [Safe alongside a running CLI](#safe-alongside-a-running-cli)).
 - **What the provider learns:** that accountant, from your IP address, checked each of these accounts at
   the same moment, which ties them to one another (see [Is this allowed?](#is-this-allowed)).
 
@@ -300,6 +304,11 @@ Checked against Claude Code 2.1.292 and Codex 0.160.0. Older Claude Code release
 - **Claude Code's config lock.** `~/.claude.json` is rewritten by every running Claude Code. accountant
   patches `oauthAccount` under Claude Code's own lock (the `proper-lockfile` directory beside the file),
   so neither side loses the other's change.
+- **A stale account record.** After a switch, an old Claude Code session can write its own account back
+  into `~/.claude.json`, beside another account's tokens. Saved tokens are recognised by their
+  fingerprint; tokens accountant hasn't seen are asked whose they are before they are saved, and a live
+  login's meter counts only for the account holding exactly its tokens. With usage meters off,
+  accountant can't ask and trusts the record.
 - **Tokens that rotate mid-switch.** If a CLI refreshes its login between the *save* and *swap* steps,
   the newer tokens are saved too before the swap.
 - **A Keychain that does not answer** (locked, dialog left open) times out with a clear message instead

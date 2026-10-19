@@ -8,12 +8,14 @@
 use crate::config::Config;
 use crate::fsutil;
 use crate::paths::Paths;
-use crate::providers::{self, Identity, Provider, Snapshot};
+use crate::providers::{self, AccessToken, Identity, Provider, Snapshot};
 use crate::registry::{Profile, Registry};
 use crate::secrets::Vault;
 use crate::twofa;
+use crate::usage;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
+use serde_json::Value;
 use std::fs::File;
 use std::process::{Command, Stdio};
 
@@ -22,6 +24,8 @@ pub struct Engine {
     pub vault: Vault,
     pub config: Config,
     pub registry: Registry,
+    /// Asks whose a Claude access token is ([`usage::claude_account`]).
+    pub claude_account: fn(&AccessToken) -> Result<Value>,
 }
 
 /// Exclusive lock on accountant's state, held while mutating.
@@ -113,6 +117,7 @@ impl Engine {
             config,
             registry: Registry::load(&paths.registry())?,
             paths,
+            claude_account: usage::claude_account,
         })
     }
 
@@ -182,6 +187,46 @@ impl Engine {
             .iter()
             .find(|p| p.provider == provider && p.fingerprint.as_ref() == Some(&fp))
             .map(|p| p.id.clone())
+    }
+
+    /// A Claude login's account record sits in `~/.claude.json`, apart from
+    /// its tokens, and every running Claude Code rewrites that file: after a
+    /// switch, an old session can write its own account back. Tokens no
+    /// profile holds yet (a new sign-in, or tokens the CLI rotated) are asked
+    /// whose they are, with usage meters on, and a record naming someone else
+    /// is put right before anything is saved. Without an answer it stands.
+    fn verified(&self, provider: Provider, (snap, ident): (Snapshot, Identity)) -> (Snapshot, Identity) {
+        if provider != Provider::Claude
+            || !self.config.ui.usage
+            || self.fingerprint_owner(provider, &snap).is_some()
+        {
+            return (snap, ident);
+        }
+        let Some(record) =
+            providers::fresh_access_token(provider, &snap).and_then(|tok| (self.claude_account)(&tok).ok())
+        else {
+            return (snap, ident);
+        };
+        let with_record = |record: Value| {
+            let mut fixed = snap.clone();
+            fixed["oauthAccount"] = record;
+            let ident = providers::identity(provider, &fixed);
+            (fixed, ident)
+        };
+        let (fixed, Some(actual)) = with_record(record) else {
+            return (snap, ident);
+        };
+        if actual.key == ident.key {
+            return (snap, ident);
+        }
+        // The fuller record Claude Code wrote for that account, if it is saved.
+        self.registry
+            .by_identity(provider, &actual.key)
+            .and_then(|p| self.vault.get(&p.vault_key()).ok().flatten())
+            .and_then(|raw| serde_json::from_str::<Snapshot>(&raw).ok())
+            .map(|saved| with_record(saved["oauthAccount"].clone()))
+            .and_then(|(saved, i)| i.filter(|i| i.key == actual.key).map(|i| (saved, i)))
+            .unwrap_or((fixed, actual))
     }
 
     /// The profile a login is saved under. A weak identity is matched by its
@@ -263,9 +308,10 @@ impl Engine {
         provider: Provider,
         live: Option<(Snapshot, Identity)>,
     ) -> Result<Synced> {
-        let Some((snap, ident)) = live else {
+        let Some(live) = live else {
             return Ok(Synced::NothingLive);
         };
+        let (snap, ident) = self.verified(provider, live);
         // The exact credentials of a saved profile whose account metadata
         // disagrees: the metadata is stale (rewritten by an old session). The
         // vault already holds these credentials with the right metadata.
@@ -289,9 +335,10 @@ impl Engine {
     /// Save the live login as a profile, optionally naming it.
     pub fn save_current(&mut self, provider: Provider, name: Option<&str>) -> Result<Option<(String, bool)>> {
         let _lock = self.lock()?;
-        let Some((snap, ident)) = self.live(provider)? else {
+        let Some(live) = self.live(provider)? else {
             return Ok(None);
         };
+        let (snap, ident) = self.verified(provider, live);
         let existing = match self.existing(provider, &snap, &ident) {
             // A weak key cannot tell accounts apart: a new name means a new one.
             Some(id)
@@ -414,9 +461,10 @@ impl Engine {
             // Claude: `claude auth login` already wrote the live login.
             None => previous.map(String::from),
         };
-        let (snap, ident) = self
+        let live = self
             .live(provider)?
             .ok_or_else(|| anyhow!("sign-in finished but no {} login was found", provider.label()))?;
+        let (snap, ident) = self.verified(provider, live);
         let (id, created) = self.store(provider, &snap, &ident, name)?;
         let now = Utc::now();
         if let Some(prev) = previous.filter(|p| *p != id)
@@ -568,7 +616,16 @@ mod tests {
         std::fs::create_dir_all(&paths.codex_home).unwrap();
         let mut engine = Engine::open_at(paths).unwrap();
         engine.vault = Vault::Files(root.join("data/secrets"));
+        engine.claude_account = |_| Err(anyhow!("no network in tests"));
         (dir, engine)
+    }
+
+    /// The account record of a fake Claude login's tokens, as Anthropic
+    /// would name it: `at-<token>` belongs to `<token>@x.com`.
+    fn whose(tok: &AccessToken) -> Result<Value> {
+        let name = tok.token.strip_prefix("at-").context("not a fake token")?;
+        let name = name.trim_end_matches(char::is_numeric);
+        Ok(fake_claude(&format!("{name}@x.com"), &format!("u{name}"), "o", "")["oauthAccount"].clone())
     }
 
     fn put_codex_live(e: &Engine, auth: &str) {
@@ -693,6 +750,67 @@ mod tests {
         e.switch(&b).unwrap();
         e.switch(&a).unwrap();
         assert_eq!(e.active_id(Provider::Claude).as_deref(), Some(a.as_str()));
+    }
+
+    /// The live Claude login as Claude Code leaves it: `token`'s credentials,
+    /// with the account record of `record` beside them.
+    fn put_claude_live(e: &Engine, token: &str, record: &str) {
+        let mut snap = fake_claude("", "", "o", token);
+        snap["oauthAccount"] =
+            fake_claude(&format!("{record}@x.com"), &format!("u{record}"), "o", "")["oauthAccount"].clone();
+        providers::write_live(Provider::Claude, &e.paths, &snap).unwrap();
+    }
+
+    #[test]
+    fn rotated_tokens_under_a_stale_record_are_saved_to_their_own_account() {
+        let (_d, mut e) = sandbox();
+        e.claude_account = whose;
+        put_claude_live(&e, "a", "a");
+        let (a, _) = e.save_current(Provider::Claude, None).unwrap().unwrap();
+        put_claude_live(&e, "b", "b");
+        let (b, _) = e.save_current(Provider::Claude, None).unwrap().unwrap();
+        e.switch(&a).unwrap();
+
+        // An old session of b writes its record back, then Claude Code
+        // rotates a's tokens: nothing saved holds them, and the record says b.
+        put_claude_live(&e, "a2", "b");
+        e.sync_back(Provider::Claude).unwrap();
+
+        let a_saved = e.snapshot(&a).unwrap().unwrap();
+        assert!(a_saved["credentials"].as_str().unwrap().contains("rt-a2"));
+        assert_eq!(a_saved["oauthAccount"]["emailAddress"], "a@x.com", "the record is put right");
+        let b_saved = e.snapshot(&b).unwrap().unwrap();
+        assert!(b_saved["credentials"].as_str().unwrap().contains("rt-b\""), "b keeps its own login");
+        assert_eq!(e.active_id(Provider::Claude).as_deref(), Some(a.as_str()));
+    }
+
+    #[test]
+    fn a_new_sign_in_under_a_stale_record_is_a_new_account() {
+        let (_d, mut e) = sandbox();
+        e.claude_account = whose;
+        put_claude_live(&e, "a", "a");
+        let (a, _) = e.save_current(Provider::Claude, None).unwrap().unwrap();
+
+        // `claude auth login` signs c in; a session still on a rewrites the record.
+        put_claude_live(&e, "c", "a");
+        let (c, created) = e.finish_login(Provider::Claude, None, Some("c"), Some(&a)).unwrap();
+
+        assert!(created);
+        assert_ne!(c, a);
+        assert_eq!(e.profile(&c).unwrap().email.as_deref(), Some("c@x.com"));
+        let a_saved = e.snapshot(&a).unwrap().unwrap();
+        assert!(a_saved["credentials"].as_str().unwrap().contains("rt-a\""), "a keeps its own login");
+    }
+
+    #[test]
+    fn with_usage_meters_off_nothing_is_asked() {
+        let (_d, mut e) = sandbox();
+        e.config.ui.usage = false;
+        e.claude_account = |_| panic!("asked Anthropic with usage meters off");
+        put_claude_live(&e, "a", "a");
+        e.save_current(Provider::Claude, None).unwrap().unwrap();
+        put_claude_live(&e, "a2", "a");
+        e.sync_back(Provider::Claude).unwrap();
     }
 
     #[test]

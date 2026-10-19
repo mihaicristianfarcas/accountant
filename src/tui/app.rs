@@ -294,21 +294,31 @@ impl App {
         }
         let vault = self.engine.vault.clone();
         let paths = self.engine.paths.clone();
-        let jobs: Vec<(String, Provider, bool)> =
-            self.profiles().iter().map(|p| (p.id.clone(), p.provider, self.is_active(p))).collect();
+        let jobs: Vec<(String, Provider, bool, Option<String>)> = self
+            .profiles()
+            .iter()
+            .map(|p| (p.id.clone(), p.provider, self.is_active(p), p.fingerprint.clone()))
+            .collect();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut fetches = vec![];
-            for (id, provider, active) in jobs {
-                let snap = if active {
-                    providers::read_live(provider, &paths).ok().flatten()
-                } else {
+            for (id, provider, active, fingerprint) in jobs {
+                // A Claude account record can name another account than the
+                // tokens beside it (see `Engine::verified`), so the live
+                // tokens count only for the profile holding exactly them.
+                let live = active
+                    .then(|| providers::read_live(provider, &paths).ok().flatten())
+                    .flatten()
+                    .filter(|s| {
+                        provider != Provider::Claude || providers::fingerprint(provider, s) == fingerprint
+                    });
+                let snap = live.or_else(|| {
                     vault
                         .get(&format!("profile:{id}"))
                         .ok()
                         .flatten()
                         .and_then(|s| serde_json::from_str(&s).ok())
-                };
+                });
                 if let Some(tok) = snap.as_ref().and_then(|s| providers::fresh_access_token(provider, s)) {
                     fetches.push((id, provider, tok));
                 }

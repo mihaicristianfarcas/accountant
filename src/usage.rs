@@ -123,6 +123,47 @@ pub fn fetch(provider: Provider, tok: &AccessToken) -> Result<Usage> {
     Ok(Usage { windows, fetched_at: Utc::now() })
 }
 
+/// Whose a Claude access token is, as the `oauthAccount` record Claude Code
+/// writes into `~/.claude.json`: it asks the same endpoint after a sign-in.
+pub fn claude_account(tok: &AccessToken) -> Result<Value> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(4)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut resp = agent
+        .get("https://api.anthropic.com/api/oauth/profile")
+        .header("Authorization", &format!("Bearer {}", tok.token))
+        .header("User-Agent", concat!("accountant/", env!("CARGO_PKG_VERSION")))
+        .call()?;
+    let status = resp.status().as_u16();
+    if status != 200 {
+        bail!("profile endpoint answered HTTP {status}");
+    }
+    claude_record(&resp.body_mut().read_json()?)
+        .ok_or_else(|| anyhow::anyhow!("profile response named no account"))
+}
+
+/// `{"account": {"uuid", "email", …}, "organization": {"uuid", "name", …}}`
+/// → `{"accountUuid", "emailAddress", "organizationUuid", …}`, the fields
+/// Claude Code copies from it.
+fn claude_record(v: &Value) -> Option<Value> {
+    let text = |path: &str| v.pointer(path).and_then(Value::as_str).filter(|s| !s.is_empty());
+    let mut record = serde_json::Map::new();
+    record.insert("accountUuid".into(), text("/account/uuid")?.into());
+    record.insert("organizationUuid".into(), text("/organization/uuid")?.into());
+    for (key, path) in [
+        ("emailAddress", "/account/email"),
+        ("organizationName", "/organization/name"),
+        ("displayName", "/account/display_name"),
+    ] {
+        if let Some(value) = text(path) {
+            record.insert(key.into(), value.into());
+        }
+    }
+    Some(Value::Object(record))
+}
+
 /// The provider no longer accepts the saved login: a browser sign-in is due.
 #[derive(Debug)]
 pub struct Revoked;
@@ -295,6 +336,20 @@ mod tests {
         assert_eq!(w.iter().map(|w| w.label.as_str()).collect::<Vec<_>>(), ["5h", "5h gpt-5-codex-mini"]);
         assert!(w.iter().all(|w| is_window_label(&w.label)), "they survive the cache");
         assert_eq!(Usage { windows: w, fetched_at: Utc::now() }.binding().unwrap().used, 90.0);
+    }
+
+    #[test]
+    fn a_claude_profile_reads_as_the_record_claude_code_writes() {
+        let v = json!({
+            "account": {"uuid": "u1", "email": "a@x.com", "display_name": "A", "full_name": null},
+            "organization": {"uuid": "o1", "name": "a@x.com's Organization", "billing_type": "stripe"}
+        });
+        assert_eq!(
+            claude_record(&v),
+            Some(json!({"accountUuid": "u1", "emailAddress": "a@x.com", "organizationUuid": "o1",
+                "organizationName": "a@x.com's Organization", "displayName": "A"}))
+        );
+        assert_eq!(claude_record(&json!({"account": {"uuid": "u1"}})), None, "no organization, no key");
     }
 
     #[test]
